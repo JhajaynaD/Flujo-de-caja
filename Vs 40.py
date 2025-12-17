@@ -269,8 +269,24 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
     # ----------------------------------------------------------
     # 2) REGLAS SECUNDARIAS: "CONTIENTE" SOLO donde NO tipificado
     # ----------------------------------------------------------
+# IVA: SOLO si realmente es un movimiento de IVA (no pagos a proveedores)
     empty_tipo = ~tipificado
+    
+    m = empty_tipo & (
+        b["_detalle_norm"].str.startswith("IVA ", na=False) |
+        b["_detalle_norm"].str.startswith("COBRO IVA SERVICIOS FINANCIEROS", na=False) |
+        b["_detalle_norm"].str.contains("CARGO IVA", na=False) |
+        b["_detalle_norm"].str.startswith("IVA CUOTA MANEJO", na=False) |
+        b["_detalle_norm"].str.startswith("IVA SUC VIRT", na=False) |
+        b["_detalle_norm"].str.startswith("COBRO IVA PAGOS AUTOMATICOS", na=False) |
+        b["_detalle_norm"].str.startswith("IVA SUC VIRT EMP", na=False)
+    )
+    b.loc[m, "Tipo"] = "GB"
+    b.loc[m, "Cuenta"] = "24080213"
+    b.loc[m, "Concepto"] = "IVA"
 
+    # IMPORTANTE: recalcular para que no se pisen reglas después
+    empty_tipo = b["Tipo"].astype(str).str.strip().eq("")
     # Davivienda - Cobro Servicio Manejo Portal => GB 530515
     m = (
         empty_tipo &
@@ -278,17 +294,8 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         (b["_detalle_norm"].str.contains("COBRO SERVICIO MANEJO PORTAL", na=False))
     )
     b.loc[m, "Tipo"] = "GB"
-    b.loc[m, "Cuenta"] = "530515"
+    b.loc[m, "Cuenta"] = "530505"
     b.loc[m, "Concepto"] = "GASTOS BANCARIOS"
-
-    # IVA
-    m = empty_tipo & (
-        b["_detalle_norm"].str.contains("CARGO IVA", na=False) |
-        b["_detalle_norm"].str.contains(r"\bIVA\b", na=False)
-    )
-    b.loc[m, "Tipo"] = "GB"
-    b.loc[m, "Cuenta"] = "24080213"
-    b.loc[m, "Concepto"] = "IVA"
 
     # Rendimientos Fiducia
     m = empty_tipo & (b["_banco_norm"] == "FIDUCIA") & (b["_detalle_norm"].str.startswith("RENDIMIENTOS FIDUCIA", na=False))
@@ -301,7 +308,7 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
     b.loc[m, "Tipo"] = "Ingreso"
     b.loc[m, "Cuenta"] = "421005"
     b.loc[m, "Concepto"] = "BBVA"
-
+    
     # Gastos bancarios: cobros / comisiones
     m = empty_tipo & (
         b["_detalle_norm"].str.contains("COBRO PAGO", na=False) |
@@ -355,7 +362,7 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
     m = empty_con & (b["_banco_norm"] == "BANCOLOMBIA") & (b["_detalle_norm"].str.startswith("PAGO PSE", na=False))
     b.loc[m, "Concepto"] = "Proveedores"
 
-    m = empty_con & (b["_banco_norm"] == "BANCOLOMBIA") & (b["_detalle_norm"].str.startswith("PAGO A P", na=False))
+    m = empty_con & (b["_banco_norm"] == "BANCOLOMBIA") & (b["_detalle_norm"].str.startswith("PAGO A PROVE", na=False))
     b.loc[m, "Concepto"] = "Proveedores"
 
     b.drop(columns=["_banco_norm", "_detalle_norm"], inplace=True, errors="ignore")
@@ -1174,3 +1181,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
