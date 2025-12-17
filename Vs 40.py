@@ -6,10 +6,8 @@ from datetime import datetime, timedelta
 from calendar import monthrange
 from typing import Optional, Dict, Tuple, List
 
-
 import pandas as pd
 
-from PySide6.QtCore import Qt
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget,
@@ -26,6 +24,7 @@ from PySide6.QtWidgets import (
 def last_day_of_month(year: int, month: int) -> pd.Timestamp:
     return pd.Timestamp(datetime(year, month, monthrange(year, month)[1])).normalize()
 
+
 def parse_date_any(x) -> pd.Timestamp:
     if pd.isna(x):
         return pd.NaT
@@ -34,13 +33,14 @@ def parse_date_any(x) -> pd.Timestamp:
     s = str(x).strip()
     if not s:
         return pd.NaT
-    # intenta mm/dd y dd/mm
+
     dt = pd.to_datetime(s, errors="coerce", dayfirst=False)
     if pd.isna(dt):
         dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
     if pd.isna(dt):
         return pd.NaT
     return pd.Timestamp(dt).normalize()
+
 
 def to_float_money(x) -> float:
     """
@@ -72,6 +72,7 @@ def to_float_money(x) -> float:
         val = -abs(val)
     return float(val)
 
+
 def norm_upper(s) -> str:
     return str(s).upper().strip() if s is not None else ""
 
@@ -93,8 +94,6 @@ class BankFiles:
 
     agrario_mov_xls: Optional[str] = None
     agrario_inf_xls: Optional[str] = None
-    agrario_inf_year: Optional[int] = None
-    agrario_inf_month: Optional[int] = None
 
     bbva_xls: Optional[str] = None
 
@@ -126,6 +125,7 @@ class RunConfig:
     otros: OtherFiles = field(default_factory=OtherFiles)
     salida_xlsx: str = "Cruce_Flujo_Caja.xlsx"
 
+
 # ==========================================================
 # Mapeo cuentas -> banco (Auxiliar)
 # ==========================================================
@@ -140,6 +140,229 @@ CUENTA_A_BANCO = {
 
 
 # ==========================================================
+# Reglas embebidas (sin archivo Reglas.xlsx)
+# ==========================================================
+def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
+    b = bancos.copy()
+
+    b["_banco_norm"] = b["Banco"].astype(str).str.upper().str.strip()
+    b["_detalle_norm"] = b["Detalle"].fillna("").astype(str).str.upper().str.strip()
+
+    # Asegurar columnas
+    for col in ["Tipo", "Cuenta", "Concepto"]:
+        if col not in b.columns:
+            b[col] = ""
+        b[col] = b[col].fillna("").astype(str)
+
+    # ----------------------------------------------------------
+    # 0) Cuenta por banco (solo si está vacía)
+    # ----------------------------------------------------------
+    empty_cta = b["Cuenta"].astype(str).str.strip().eq("")
+    b.loc[empty_cta, "Cuenta"] = b.loc[empty_cta, "_banco_norm"].map(CUENTA_A_BANCO).fillna("")
+
+    # ----------------------------------------------------------
+    # 1) REGLAS PRIORITARIAS: "INICIA CON" (sobrescriben)
+    # ----------------------------------------------------------
+    STARTS_RULES = [
+        # AGRARIO
+        ("AGRARIO", "TRASLADO INTERBANCARIO", "Egreso", "", "Proveedores"),
+        ("AGRARIO", "RECAUDOS DE CONVENIOS", "Ingreso", "", "Agrario"),
+        ("AGRARIO", "INTERNET TRANSFERENCIAS ENTRE TERCEROS INTERNET", "Ingreso", "", "Agrario"),
+
+        # BANCOLOMBIA - EGRESO (conceptos específicos)
+        ("BANCOLOMBIA", "PAGO PSE IMPUESTO DIAN", "Egreso", "", "Impuestos"),
+        ("BANCOLOMBIA", "PAGO PSE MUNICIPIO DE YUMBO", "Egreso", "", "Impuestos"),
+        ("BANCOLOMBIA", "PAGO A PROVE LOPEZ MORALES J", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "CARGUE TARJETA PREPAGO PROPIA", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO A PROV JGN BBVA AHORRO", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO A PROV UPEGUI NARANJO ADR", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO PSE ASOPAGOS", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO PSE BANCOLOMBIA", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO A PROVE OPERADORA DE SE", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO A PROVE COMFAMA", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO A PROVE FIDEICOMISO MAS", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO PSE BANCOOMEVA", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO PSE APORTES EN LINEA", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO A PROV RIO CLARO AGRO BCO", "Egreso", "", "Traslado"),
+
+        # BANCOLOMBIA - reglas generales controladas
+        ("BANCOLOMBIA", "PAGO A NOMIN", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO PROGRAMADO", "Egreso", "", "Proveedores"),
+        ("BANCOLOMBIA", "TRASLADO A FONDO DE INVERSION", "Egreso", "", "Traslado"),
+        ("BANCOLOMBIA", "PAGO CUOTA CREDITO BANCOL", "Egreso", "", "Credito"),
+        ("BANCOLOMBIA", "TRANSF INTERNACIONAL ENVIADA", "Egreso", "", "Proveedores"),
+        ("BANCOLOMBIA", "PAGO SUC VIRT TC VISA", "Egreso", "", "Credito"),
+        ("BANCOLOMBIA", "PAGO AUTOM TC VISA", "Egreso", "", "Credito"),
+        ("BANCOLOMBIA", "PAGO CREDITO SUC VIRTUAL", "Egreso", "", "Proveedores"),
+        ("BANCOLOMBIA", "PAGO SEGUROS GENERALES", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO SURAMERICANA DE SEGUROS", "Egreso", "", "Proveedores"),
+        ("BANCOLOMBIA", "PAGO SV", "Egreso", "", "Proveedores"),
+
+        # BANCOLOMBIA (INGRESO)
+        ("BANCOLOMBIA", "PAGO DE PROV", "Ingreso", "", "Bancolombia"),
+        ("BANCOLOMBIA", "PAGO INTERBANC", "Ingreso", "", "Bancolombia"),
+        ("BANCOLOMBIA", "CONSIG LOCAL REFEREN EFECTIVO", "Ingreso", "", "Bancolombia"),
+        ("BANCOLOMBIA", "ABONO CREDIPAGO SUC VIRTUAL", "Ingreso", "", "Credipago Bancolombia"),
+        ("BANCOLOMBIA", "REC CREDIPA", "Ingreso", "", "Bancolombia"),
+        ("BANCOLOMBIA", "TRANSF INTERNACIONAL RECIBIDA", "Ingreso", "", "Bancolombia"),
+        ("BANCOLOMBIA", "TRANSFERENCIA DESDE NEQUI", "Ingreso", "", "Bancolombia"),
+        ("BANCOLOMBIA", "TRASLADO DE FONDO DE INVERS", "Ingreso", "", "Traslado"),
+
+        # FIDUCIA
+        ("FIDUCIA", "TRASLADO DESDE", "Ingreso", "", "Traslado"),
+        ("FIDUCIA", "TRASLADO HACIA", "Egreso", "", "Traslado"),
+
+        # BBVA
+        ("BBVA", "CARGO POR TRASP", "Egreso", "", "Nomina"),
+        ("BBVA", "CARGO DOMICILIA", "Egreso", "", "Proveedores"),
+        ("BBVA", "CARGO CUENTA TR", "Egreso", "", "Nomina"),
+        ("BBVA", "DEPOSITO EFECTI", "Ingreso", "", "BBVA"),
+        ("BBVA", "DEPOSITO EN EFE", "Ingreso", "", "BBVA"),
+        ("BBVA", "ABONO POR DOMIC", "Ingreso", "", "BBVA"),
+        ("BBVA", "RECIBISTE DINER", "Ingreso", "", "BBVA"),
+
+        # BOGOTÁ
+        ("BOGOTÁ", "CR ACH BANCOLOMBIA RIO CLARO TECNOL NIT890927624 FAC RIO CLARO TECNOLOGIA", "Ingreso", "", "Traslado"),
+        ("BOGOTÁ", "PAGO AUTOMATICO CUOTA DE CREDITO", "Egreso", "", "Credito"),
+        ("BOGOTÁ", "PAGO TARJETA", "Egreso", "", "Credito"),
+        ("BOGOTÁ", "ABONO DISPERSION PAGO A PROVEEDORES", "Ingreso", "", "Bogotá"),
+        ("BOGOTÁ", "ABONO POR DEPOSITO EN CORRESPONSAL", "Ingreso", "", "Bogotá"),
+        ("BOGOTÁ", "ABONO TRANSFERENCIA POR BUSINESS", "Ingreso", "", "Bogotá"),
+        ("BOGOTÁ", "CONSIGNACION NACIONAL", "Ingreso", "", "Bogotá"),
+        ("BOGOTÁ", "CR ACH BANDAVIVIENDA", "Ingreso", "", "Bogotá"),
+
+        # DAVIVIENDA
+        ("DAVIVIENDA", "DESCUENTO TRANSFERENCIA", "Egreso", "", "Proveedores"),
+        ("DAVIVIENDA", "TRANF DE CONTINGEN A CTA AFC", "Egreso", "", "Nomina"),
+        ("DAVIVIENDA", "DESCUENTO POR PAGO A PROVEEDORES 8909276244", "Egreso", "", "Nomina"),
+        ("DAVIVIENDA", "PAGO CREDITO N", "Egreso", "", "Credito"),
+        ("DAVIVIENDA", "ABONO", "Ingreso", "", "Davivienda"),
+        ("DAVIVIENDA", "CONSIGNACION EFECTIVO EN OFICINA", "Ingreso", "", "Davivienda"),
+    ]
+
+    # --- REGLA ESPECIAL: BANCOLOMBIA "TRANSFERENCIA CTA SUC VIRTUAL" depende del signo ---
+    m_suc = (b["_banco_norm"] == "BANCOLOMBIA") & (b["_detalle_norm"].str.startswith("TRANSFERENCIA CTA SUC VIRTUAL", na=False))
+    if m_suc.any():
+        v_suc = pd.to_numeric(b.loc[m_suc, "Valor"], errors="coerce").fillna(0.0)
+        m_pos = m_suc.copy(); m_pos[m_suc] = v_suc > 0
+        m_neg = m_suc.copy(); m_neg[m_suc] = v_suc < 0
+
+        b.loc[m_pos, "Tipo"] = "Ingreso"
+        b.loc[m_pos, "Cuenta"] = ""
+        b.loc[m_pos, "Concepto"] = "Bancolombia"
+
+        b.loc[m_neg, "Tipo"] = "Egreso"
+        b.loc[m_neg, "Cuenta"] = ""
+        b.loc[m_neg, "Concepto"] = "Proveedores"
+
+    # Aplica reglas "inicia con"
+    for banco, patron, tipo, cuenta, concepto in STARTS_RULES:
+        m = (b["_banco_norm"] == banco) & (b["_detalle_norm"].str.startswith(patron, na=False))
+        if m.any():
+            b.loc[m, "Tipo"] = tipo
+            b.loc[m, "Cuenta"] = cuenta
+            b.loc[m, "Concepto"] = concepto
+
+    # Marcar cuáles ya quedaron tipificados por reglas fuertes
+    tipificado = b["Tipo"].astype(str).str.strip().ne("")
+
+    # ----------------------------------------------------------
+    # 2) REGLAS SECUNDARIAS: "CONTIENTE" SOLO donde NO tipificado
+    # ----------------------------------------------------------
+    empty_tipo = ~tipificado
+
+    # Davivienda - Cobro Servicio Manejo Portal => GB 530515
+    m = (
+        empty_tipo &
+        (b["_banco_norm"] == "DAVIVIENDA") &
+        (b["_detalle_norm"].str.contains("COBRO SERVICIO MANEJO PORTAL", na=False))
+    )
+    b.loc[m, "Tipo"] = "GB"
+    b.loc[m, "Cuenta"] = "530515"
+    b.loc[m, "Concepto"] = "GASTOS BANCARIOS"
+
+    # IVA
+    m = empty_tipo & (
+        b["_detalle_norm"].str.contains("CARGO IVA", na=False) |
+        b["_detalle_norm"].str.contains(r"\bIVA\b", na=False)
+    )
+    b.loc[m, "Tipo"] = "GB"
+    b.loc[m, "Cuenta"] = "24080213"
+    b.loc[m, "Concepto"] = "IVA"
+
+    # Rendimientos Fiducia
+    m = empty_tipo & (b["_banco_norm"] == "FIDUCIA") & (b["_detalle_norm"].str.startswith("RENDIMIENTOS FIDUCIA", na=False))
+    b.loc[m, "Tipo"] = "Ingreso"
+    b.loc[m, "Cuenta"] = "421005"
+    b.loc[m, "Concepto"] = "FIDUCIA"
+
+    # BBVA ABONO POR INTER
+    m = empty_tipo & (b["_banco_norm"] == "BBVA") & (b["_detalle_norm"].str.startswith("ABONO POR INTER", na=False))
+    b.loc[m, "Tipo"] = "Ingreso"
+    b.loc[m, "Cuenta"] = "421005"
+    b.loc[m, "Concepto"] = "BBVA"
+
+    # Gastos bancarios: cobros / comisiones
+    m = empty_tipo & (
+        b["_detalle_norm"].str.contains("COBRO PAGO", na=False) |
+        b["_detalle_norm"].str.contains("SERVICIO POR PAGOS", na=False) |
+        b["_detalle_norm"].str.contains("SERVICIO PAGO", na=False) |
+        b["_detalle_norm"].str.contains("DESCUENTO COBRO SERVICIOS ENTRE CIUD", na=False) |
+        b["_detalle_norm"].str.contains("COMISION", na=False) |
+        b["_detalle_norm"].str.contains(r"\bCOMIS\b", na=False)
+    )
+    b.loc[m, "Tipo"] = "GB"
+    b.loc[m, "Cuenta"] = "530515"
+    b.loc[m, "Concepto"] = "GASTOS BANCARIOS"
+    
+    m = empty_tipo & (
+        b["_detalle_norm"].str.contains("CUOTA MANEJO", na=False)
+    )
+    b.loc[m, "Tipo"] = "GB"
+    b.loc[m, "Cuenta"] = "530505"
+    b.loc[m, "Concepto"] = "GASTOS BANCARIOS"
+    
+    m = empty_tipo & (
+        b["_detalle_norm"].str.contains("RETENCIÓN EN LA FUENTE", na=False)
+    )
+    b.loc[m, "Tipo"] = "GB"
+    b.loc[m, "Cuenta"] = "13551506"
+    b.loc[m, "Concepto"] = "RTEFTE"
+
+    # GMF / 4x1000
+    m = empty_tipo & (
+        b["_detalle_norm"].str.contains(r"\bGMF\b", na=False) |
+        b["_detalle_norm"].str.contains("IMPTO GOBIERNO 4X1000", na=False) |
+        b["_detalle_norm"].str.contains("CARGO POR IMPUE", na=False) |
+        b["_detalle_norm"].str.contains("GRAVAMEN MOVIMIENTOS FINANCIEROS", na=False)
+    )
+    b.loc[m, "Tipo"] = "GB"
+    b.loc[m, "Cuenta"] = "53059501"
+    b.loc[m, "Concepto"] = "GMF"
+
+    # ----------------------------------------------------------
+    # 3) Fallback: si aún quedó Tipo vacío, por signo
+    # ----------------------------------------------------------
+    v = pd.to_numeric(b["Valor"], errors="coerce").fillna(0.0)
+    empty_tipo2 = b["Tipo"].astype(str).str.strip().eq("")
+    b.loc[empty_tipo2 & (v > 0), "Tipo"] = "Ingreso"
+    b.loc[empty_tipo2 & (v < 0), "Tipo"] = "Egreso"
+
+    # ----------------------------------------------------------
+    # 4) ÚLTIMO recurso: Proveedores solo si NO quedó concepto (para no pisar)
+    # ----------------------------------------------------------
+    empty_con = b["Concepto"].astype(str).str.strip().eq("")
+    m = empty_con & (b["_banco_norm"] == "BANCOLOMBIA") & (b["_detalle_norm"].str.startswith("PAGO PSE", na=False))
+    b.loc[m, "Concepto"] = "Proveedores"
+
+    m = empty_con & (b["_banco_norm"] == "BANCOLOMBIA") & (b["_detalle_norm"].str.startswith("PAGO A P", na=False))
+    b.loc[m, "Concepto"] = "Proveedores"
+
+    b.drop(columns=["_banco_norm", "_detalle_norm"], inplace=True, errors="ignore")
+    return b
+
+
+# ==========================================================
 # Carga Bancos
 # ==========================================================
 def load_bancolombia_csv(path: str) -> pd.DataFrame:
@@ -149,19 +372,16 @@ def load_bancolombia_csv(path: str) -> pd.DataFrame:
         dtype=str,
         sep=",",
         engine="python",
-        skipinitialspace=True,   # 🔥 clave: quita espacios después de coma
+        skipinitialspace=True,
         on_bad_lines="skip",
         encoding="latin1"
     )
 
-    # Fecha en col 3 (YYYYMMDD)
     s_fecha = df.iloc[:, 3].astype(str).str.strip()
     fecha = pd.to_datetime(s_fecha, format="%Y%m%d", errors="coerce").dt.normalize()
 
-    # Detalle en col 7
     detalle = df.iloc[:, 7].astype(str).str.strip()
 
-    # Valor en col 5
     s_valor = df.iloc[:, 5].astype(str).str.strip()
     valor = pd.to_numeric(s_valor, errors="coerce").fillna(0.0)
 
@@ -172,9 +392,9 @@ def load_bancolombia_csv(path: str) -> pd.DataFrame:
         "Valor": valor
     })
 
-    # Filtra movimientos reales
     out["Detalle"] = out["Detalle"].replace({"nan": None, "NaN": None, "": None})
     return out.dropna(subset=["Fecha", "Detalle"])
+
 
 def load_fiducia_csv(path: str, anio: int, mes: int, rendimientos: float) -> pd.DataFrame:
     df = pd.read_csv(path, sep=";", dtype=str, encoding_errors="ignore")
@@ -188,103 +408,88 @@ def load_fiducia_csv(path: str, anio: int, mes: int, rendimientos: float) -> pd.
     df["Detalle"] = df[det_col].astype(str).str.strip()
     df["Valor"] = df[valor_col].apply(to_float_money)
 
-    out = df[["Fecha","Detalle","Valor"]].copy()
+    out = df[["Fecha", "Detalle", "Valor"]].copy()
     out["Banco"] = "Fiducia"
-    out = out[["Banco","Fecha","Detalle","Valor"]].dropna(subset=["Fecha"])
+    out = out[["Banco", "Fecha", "Detalle", "Valor"]].dropna(subset=["Fecha"])
 
-    # línea rendimientos: fecha conciliación (último día del mes)
     rend_row = pd.DataFrame([{
-        "Banco":"Fiducia",
+        "Banco": "Fiducia",
         "Fecha": last_day_of_month(anio, mes),
-        "Detalle":"Rendimientos Fiducia",
+        "Detalle": "Rendimientos Fiducia",
         "Valor": float(rendimientos)
     }])
     return pd.concat([out, rend_row], ignore_index=True)
 
+
 def load_bogota_mov_xls(path: str) -> pd.DataFrame:
-    df = pd.read_excel(path, skiprows=26, dtype=object)  # desde fila 27
+    df = pd.read_excel(path, skiprows=26, dtype=object)
     cols = list(df.columns)
 
-    fecha = pd.to_datetime(df.iloc[:, 1], errors="coerce").dt.normalize()  # col B
-    detalle = df.iloc[:, 4].astype(str).str.strip()                        # col E
+    fecha = pd.to_datetime(df.iloc[:, 1], errors="coerce").dt.normalize()
+    detalle = df.iloc[:, 4].astype(str).str.strip()
     detalle = detalle.replace({"nan": None, "NaN": None}).ffill()
 
-    # Crédito menos Débito (robusto)
     credit_cols = [c for c in cols if "CRED" in norm_upper(c)]
-    debit_cols  = [c for c in cols if "DEB"  in norm_upper(c)]
+    debit_cols = [c for c in cols if "DEB" in norm_upper(c)]
+
     def clean_series(s):
         return (
             s.astype(str)
             .str.replace(r"[\$,]", "", regex=True)
             .str.strip()
             .replace({"nan": None, "NaN": None, "": None})
-            .ffill()   # 🔴 CLAVE: celdas combinadas
-        )
-    # --- CRÉDITOS ---
-    if credit_cols:
-        cred = pd.to_numeric(
-            clean_series(df[credit_cols[0]]),
-            errors="coerce"
-        ).fillna(0.0)
-    else:
-        cred = (
-            pd.to_numeric(clean_series(df.iloc[:, 14]), errors="coerce").fillna(0.0)
-            if len(cols) > 14 else 0.0
+            .ffill()
         )
 
-    # --- DÉBITOS ---
-    if debit_cols:
-        deb = pd.to_numeric(
-            clean_series(df[debit_cols[0]]),
-            errors="coerce"
-        ).fillna(0.0)
+    if credit_cols:
+        cred = pd.to_numeric(clean_series(df[credit_cols[0]]), errors="coerce").fillna(0.0)
     else:
-        d1 = (
-            pd.to_numeric(clean_series(df.iloc[:, 12]), errors="coerce").fillna(0.0)
-            if len(cols) > 12 else 0.0
-        )
-        d2 = (
-            pd.to_numeric(clean_series(df.iloc[:, 13]), errors="coerce").fillna(0.0)
-            if len(cols) > 13 else 0.0
-        )
+        cred = pd.to_numeric(clean_series(df.iloc[:, 14]), errors="coerce").fillna(0.0) if len(cols) > 14 else 0.0
+
+    if debit_cols:
+        deb = pd.to_numeric(clean_series(df[debit_cols[0]]), errors="coerce").fillna(0.0)
+    else:
+        d1 = pd.to_numeric(clean_series(df.iloc[:, 12]), errors="coerce").fillna(0.0) if len(cols) > 12 else 0.0
+        d2 = pd.to_numeric(clean_series(df.iloc[:, 13]), errors="coerce").fillna(0.0) if len(cols) > 13 else 0.0
         deb = d1 + d2
 
-    # ✅ REGLA BANCO DE BOGOTÁ
     valor = (cred - deb).astype(float)
 
-    out = pd.DataFrame({"Banco":"Bogotá","Fecha":fecha,"Detalle":detalle,"Valor":valor})
+    out = pd.DataFrame({"Banco": "Bogotá", "Fecha": fecha, "Detalle": detalle, "Valor": valor})
     return out.dropna(subset=["Fecha"])
 
+
 def load_bogota_informe_csv(path: str, year: int) -> pd.DataFrame:
-    # CSV desde fila 2 (skip first row)
     df = pd.read_csv(path, skiprows=1, dtype=str, encoding_errors="ignore")
-    # Fecha col1 mm/dd sin año => añadir año
     fecha_raw = df.iloc[:, 0].astype(str).str.strip()
-    # construir yyyy-mm-dd
     fecha = pd.to_datetime(fecha_raw + f"/{year}", errors="coerce", dayfirst=False).dt.normalize()
+
     detalle = df.iloc[:, 1].astype(str).str.strip()
     deb = df.iloc[:, 4].apply(to_float_money)
     cred = df.iloc[:, 5].apply(to_float_money)
     valor = (cred - deb).astype(float)
-    out = pd.DataFrame({"Banco":"Bogotá","Fecha":fecha,"Detalle":detalle,"Valor":valor})
+
+    out = pd.DataFrame({"Banco": "Bogotá", "Fecha": fecha, "Detalle": detalle, "Valor": valor})
     return out.dropna(subset=["Fecha"])
 
+
 def load_davivienda_xls(path: str) -> pd.DataFrame:
-    df = pd.read_excel(path, skiprows=2, dtype=object)  # desde fila 3
+    df = pd.read_excel(path, skiprows=2, dtype=object)
     fecha = pd.to_datetime(df.iloc[:, 0], errors="coerce", dayfirst=True).dt.normalize()
+
     detalle = df.iloc[:, 7].astype(str).str.strip()
     valor_base = df.iloc[:, 8].apply(to_float_money)
 
     tran = df.iloc[:, 2].astype(str).str.upper()
-    sign = pd.Series([1]*len(df))
+    sign = pd.Series([1] * len(df))
     sign[tran.str.contains("NOTAS DEBITO", na=False)] = -1
-    valor = valor_base.abs() * sign
 
-    out = pd.DataFrame({"Banco":"Davivienda","Fecha":fecha,"Detalle":detalle,"Valor":valor})
+    valor = valor_base.abs() * sign
+    out = pd.DataFrame({"Banco": "Davivienda", "Fecha": fecha, "Detalle": detalle, "Valor": valor})
     return out.dropna(subset=["Fecha"])
 
+
 def _agrario_split_iva(df_in: pd.DataFrame, base_text: str) -> pd.DataFrame:
-    # divide valor entre 1.19, redondea 0 decimales, crea línea IVA con diferencia
     mask = df_in["Detalle"].astype(str).str.contains(base_text, na=False)
     if not mask.any():
         return df_in
@@ -296,6 +501,7 @@ def _agrario_split_iva(df_in: pd.DataFrame, base_text: str) -> pd.DataFrame:
         v = float(r["Valor"])
         base = round(v / 1.19)
         iva = round(v - base)
+
         r_base = r.copy()
         r_base["Valor"] = base
         new_rows.append(r_base)
@@ -307,74 +513,65 @@ def _agrario_split_iva(df_in: pd.DataFrame, base_text: str) -> pd.DataFrame:
 
     return pd.concat([rest, pd.DataFrame(new_rows)], ignore_index=True)
 
+
 def load_agrario_mov_xls(path: str, anio: int, mes: int) -> pd.DataFrame:
-    df = pd.read_excel(path, skiprows=10, dtype=object)  # desde fila 12
+    df = pd.read_excel(path, skiprows=10, dtype=object)
     fecha = pd.to_datetime(df.iloc[:, 0], errors="coerce", dayfirst=False).dt.normalize()
     detalle = df.iloc[:, 2].astype(str).str.strip()
 
     credito = pd.to_numeric(df.iloc[:, 3], errors="coerce").fillna(0.0)
-    debito  = pd.to_numeric(df.iloc[:, 4], errors="coerce").fillna(0.0)
-    valor = (debito -credito ).astype(float)
+    debito = pd.to_numeric(df.iloc[:, 4], errors="coerce").fillna(0.0)
+    valor = (debito - credito).astype(float)
 
-    out = pd.DataFrame({"Banco":"Agrario","Fecha":fecha,"Detalle":detalle,"Valor":valor}).dropna(subset=["Fecha"])
+    out = pd.DataFrame({"Banco": "Agrario", "Fecha": fecha, "Detalle": detalle, "Valor": valor}).dropna(subset=["Fecha"])
 
-    # GMF: columna 6 (idx5) "Impuesto GMF": sumar y crear línea en último día del mes (negativo)
-    gmf_col = df.iloc[:, 5] if df.shape[1] > 5 else pd.Series([0]*len(df))
+    gmf_col = df.iloc[:, 5] if df.shape[1] > 5 else pd.Series([0] * len(df))
     gmf_total = pd.to_numeric(gmf_col, errors="coerce").fillna(0.0).sum()
     if gmf_total != 0:
         out = pd.concat([out, pd.DataFrame([{
-            "Banco":"Agrario",
+            "Banco": "Agrario",
             "Fecha": last_day_of_month(anio, mes),
-            "Detalle":"GMF",
+            "Detalle": "GMF",
             "Valor": -abs(float(gmf_total))
         }])], ignore_index=True)
 
-    # IVA splits
     out = _agrario_split_iva(out, "CNV COBRO COMISION PAGO CONVENIOS")
     out = _agrario_split_iva(out, "DB CTA CTE COMISION INTERBANCARIA")
 
     return out
 
+
 def load_agrario_informe_xls(path: str, anio: int, mes: int) -> pd.DataFrame:
-    # desde fila 16 -> skiprows=15
     df = pd.read_excel(path, skiprows=15, dtype=object)
-    # Fecha trae solo día dd en columna 2 (idx1), preguntar mes y año (recibimos)
     dia = pd.to_numeric(df.iloc[:, 1], errors="coerce").fillna(0).astype(int)
     fecha = pd.to_datetime([f"{anio}-{mes:02d}-{d:02d}" if d > 0 else None for d in dia], errors="coerce").normalize()
+
     detalle = df.iloc[:, 2].astype(str).str.strip()
-    valor = df.iloc[:, 12].apply(to_float_money) if df.shape[1] > 12 else 0.0  # col M ~ idx12
-    out = pd.DataFrame({"Banco":"Agrario","Fecha":fecha,"Detalle":detalle,"Valor":valor})
+    valor = df.iloc[:, 12].apply(to_float_money) if df.shape[1] > 12 else 0.0
+
+    out = pd.DataFrame({"Banco": "Agrario", "Fecha": fecha, "Detalle": detalle, "Valor": valor})
     return out.dropna(subset=["Fecha"])
 
-def load_bbva_xls(path: str) -> pd.DataFrame:
-    # 1) Lee en crudo para encontrar dónde inicia la tabla
-    raw = pd.read_excel(path, engine="openpyxl", header=None, dtype=object)
 
-    # Busca la fila que contiene el encabezado "FECHA DE OPERACIÓN"
+def load_bbva_xls(path: str) -> pd.DataFrame:
+    raw = pd.read_excel(path, engine="openpyxl", header=None, dtype=object)
     mask = raw.apply(lambda r: r.astype(str).str.contains("FECHA DE OPER", case=False, na=False).any(), axis=1)
     if not mask.any():
         raise ValueError("No se encontró el encabezado 'FECHA DE OPERACIÓN' en el archivo BBVA.")
+    start = int(mask.idxmax())
 
-    start = int(mask.idxmax())  # fila del encabezado
-
-    # 2) Ahora sí lee la tabla usando esa fila como header
     df = pd.read_excel(path, engine="openpyxl", skiprows=start, dtype=object)
 
-    # Columnas por posición según tu archivo:
-    # B(1)=Fecha operación, F(5)=Concepto, H(7)=Importe
     fecha = pd.to_datetime(df.iloc[:, 1], errors="coerce", dayfirst=True).dt.normalize()
-
-    # Si hay fechas "arrastradas" o vacías, rellena hacia abajo
     fecha = fecha.ffill()
 
     detalle = df.iloc[:, 5].astype(str).str.strip()
     valor = df.iloc[:, 7].apply(to_float_money)
 
     out = pd.DataFrame({"Banco": "BBVA", "Fecha": fecha, "Detalle": detalle, "Valor": valor})
-
-    # Filtra solo filas que realmente tengan movimiento (valor no nulo y detalle no vacío)
     out["Detalle"] = out["Detalle"].replace({"nan": None, "NaN": None, "": None})
     return out.dropna(subset=["Fecha", "Valor", "Detalle"])
+
 
 def build_bancos(cfg: RunConfig, log) -> pd.DataFrame:
     parts = []
@@ -389,7 +586,6 @@ def build_bancos(cfg: RunConfig, log) -> pd.DataFrame:
             raise ValueError("Fiducia cargada pero falta Rendimientos.")
         parts.append(load_fiducia_csv(cfg.bancos.fiducia_csv, cfg.anio, cfg.mes, cfg.bancos.fiducia_rendimientos))
 
-    # Bogotá
     if cfg.bancos.bogota_mov_xls:
         log("Cargando Bogotá Movimientos…")
         parts.append(load_bogota_mov_xls(cfg.bancos.bogota_mov_xls))
@@ -403,13 +599,11 @@ def build_bancos(cfg: RunConfig, log) -> pd.DataFrame:
         log("Cargando Davivienda…")
         parts.append(load_davivienda_xls(cfg.bancos.davivienda_xls))
 
-    # Agrario
     if cfg.bancos.agrario_mov_xls:
         log("Cargando Agrario Movimientos…")
         parts.append(load_agrario_mov_xls(cfg.bancos.agrario_mov_xls, cfg.anio, cfg.mes))
     elif cfg.bancos.agrario_inf_xls:
         log("Cargando Agrario Informe…")
-        # si informe, cfg trae mes/año ya. (puedes usar los mismos del periodo)
         parts.append(load_agrario_informe_xls(cfg.bancos.agrario_inf_xls, cfg.anio, cfg.mes))
 
     if cfg.bancos.bbva_xls:
@@ -422,17 +616,17 @@ def build_bancos(cfg: RunConfig, log) -> pd.DataFrame:
     bancos = pd.concat(parts, ignore_index=True)
     bancos["Fecha"] = pd.to_datetime(bancos["Fecha"], errors="coerce").dt.normalize()
     bancos = bancos.dropna(subset=["Fecha"])
-    # filtrar mes/año
+
     bancos = bancos[(bancos["Fecha"].dt.year == cfg.anio) & (bancos["Fecha"].dt.month == cfg.mes)].copy()
+
     bancos["Detalle"] = bancos["Detalle"].fillna("").astype(str).str.strip()
     bancos["Valor"] = pd.to_numeric(bancos["Valor"], errors="coerce").fillna(0.0).astype(float)
 
-    # columnas de salida esperadas
     bancos["Tipo"] = ""
     bancos["Cuenta"] = ""
     bancos["Concepto"] = ""
-
-    return bancos[["Banco","Fecha","Detalle","Valor","Tipo","Cuenta","Concepto"]]
+    bancos = bancos.reset_index(drop=True)
+    return bancos[["Banco", "Fecha", "Detalle", "Valor", "Tipo", "Cuenta", "Concepto"]]
 
 
 # ==========================================================
@@ -440,19 +634,19 @@ def build_bancos(cfg: RunConfig, log) -> pd.DataFrame:
 # ==========================================================
 def build_auxiliar(libro_aux_path: str, cfg: RunConfig, log) -> pd.DataFrame:
     log("Cargando Libro Auxiliar…")
-    df = pd.read_excel(libro_aux_path, skiprows=2, dtype=object)  # desde fila 3
+    df = pd.read_excel(libro_aux_path, skiprows=2, dtype=object)
 
     cuenta = df.iloc[:, 0].astype(str).str.replace(".0", "", regex=False).str.strip()
-    fecha = pd.to_datetime(df.iloc[:, 5], errors="coerce").dt.normalize()  # F
-    detalle = df.iloc[:, 10].astype(str).str.strip()  # K
+    fecha = pd.to_datetime(df.iloc[:, 5], errors="coerce").dt.normalize()
+    detalle = df.iloc[:, 10].astype(str).str.strip()
 
-    deb = pd.to_numeric(df.iloc[:, 15], errors="coerce").fillna(0.0)  # P
-    cred = pd.to_numeric(df.iloc[:, 16], errors="coerce").fillna(0.0) # Q
+    deb = pd.to_numeric(df.iloc[:, 15], errors="coerce").fillna(0.0)
+    cred = pd.to_numeric(df.iloc[:, 16], errors="coerce").fillna(0.0)
     valor = (deb - cred).astype(float)
 
-    comp = pd.to_numeric(df.iloc[:, 7], errors="coerce").fillna(0).astype(int).astype(str)  # H
-    doc  = pd.to_numeric(df.iloc[:, 9], errors="coerce").fillna(0).astype(int).astype(str)  # J
-    mes  = fecha.dt.month.fillna(0).astype(int).astype(str)
+    comp = pd.to_numeric(df.iloc[:, 7], errors="coerce").fillna(0).astype(int).astype(str)
+    doc = pd.to_numeric(df.iloc[:, 9], errors="coerce").fillna(0).astype(int).astype(str)
+    mes = fecha.dt.month.fillna(0).astype(int).astype(str)
     documento = comp + "-" + doc + "-" + mes
 
     out = pd.DataFrame({
@@ -463,22 +657,26 @@ def build_auxiliar(libro_aux_path: str, cfg: RunConfig, log) -> pd.DataFrame:
         "Documento": documento
     })
     out["Banco"] = out["Cuenta"].map(CUENTA_A_BANCO)
-    out = out.dropna(subset=["Banco","Fecha"])
+    out = out.dropna(subset=["Banco", "Fecha"])
     out = out[(out["Fecha"].dt.year == cfg.anio) & (out["Fecha"].dt.month == cfg.mes)].copy()
 
-    # Tipo Auxiliar por Documento
     out["Tipo"] = ""
-    out.loc[out["Documento"].astype(str).str.startswith("1-"), "Tipo"] = "Ingreso"
-    out.loc[out["Documento"].astype(str).str.startswith("2-"), "Tipo"] = "Egreso"
-    out.loc[out["Documento"].astype(str).str.startswith("5-"), "Tipo"] = "GB"
+    doc_ser = out["Documento"].astype(str).fillna("")
+    val_ser = pd.to_numeric(out["Valor"], errors="coerce").fillna(0.0)
 
-    return out[["Banco","Cuenta","Documento","Fecha","Detalle","Valor","Tipo"]]
+    out.loc[doc_ser.str.startswith("1-"), "Tipo"] = "Ingreso"
+    out.loc[doc_ser.str.startswith("2-"), "Tipo"] = "Egreso"
+    out.loc[doc_ser.str.startswith("5-"), "Tipo"] = "GB"
+    out.loc[doc_ser.str.startswith("2-") & (val_ser > 0), "Tipo"] = "Ingreso"  # regla especial
+
+    return out[["Banco", "Cuenta", "Documento", "Fecha", "Detalle", "Valor", "Tipo"]]
+
 
 def verify_balance(balance_path: str, auxiliar: pd.DataFrame, log) -> None:
     if not balance_path:
         return
     log("Verificando Balance de prueba vs Auxiliar…")
-    df = pd.read_excel(balance_path, skiprows=2, dtype=object)  # desde fila 3
+    df = pd.read_excel(balance_path, skiprows=2, dtype=object)
     cuenta = df.iloc[:, 0].astype(str).str.replace(".0", "", regex=False).str.strip()
 
     allowed = set(CUENTA_A_BANCO.keys())
@@ -505,70 +703,11 @@ def verify_balance(balance_path: str, auxiliar: pd.DataFrame, log) -> None:
 
 
 # ==========================================================
-# Reglas (Tipo/Cuenta/Concepto) desde Excel
-# ==========================================================
-def load_rules(rules_path: str) -> pd.DataFrame:
-    rules = pd.read_excel(rules_path, sheet_name="Reglas")
-    rules["Banco_norm"] = rules["Banco"].astype(str).str.upper().str.strip()
-    rules["Patron_norm"] = rules["Patron"].astype(str).str.upper().str.strip()
-    rules["Match_norm"] = rules["Match"].astype(str).str.lower().str.strip()
-    rules["Tipo"] = rules["Tipo"].fillna("").astype(str)
-    rules["Cuenta"] = rules["Cuenta"].fillna("").astype(str)
-    rules["Concepto"] = rules["Concepto"].fillna("").astype(str)
-    rules["Prioridad"] = pd.to_numeric(rules["Prioridad"], errors="coerce").fillna(999).astype(int)
-    rules = rules.sort_values("Prioridad", ascending=True)
-    return rules
-
-def apply_rules_to_bancos(bancos: pd.DataFrame, rules: pd.DataFrame) -> pd.DataFrame:
-    b = bancos.copy()
-    b["_banco_norm"] = b["Banco"].astype(str).str.upper().str.strip()
-    b["_detalle_norm"] = b["Detalle"].astype(str).str.upper().str.strip()
-
-    for _, r in rules.iterrows():
-        banco_rule = r["Banco_norm"]
-        patron = r["Patron_norm"]
-        match = r["Match_norm"]
-        tipo = str(r["Tipo"]).strip()
-        cuenta = str(r["Cuenta"]).strip()
-        concepto = str(r["Concepto"]).strip()
-
-        if match == "startswith":
-            m = b["_detalle_norm"].str.startswith(patron)
-        else:
-            m = b["_detalle_norm"].str.contains(patron, na=False)
-
-        if banco_rule != "CUALQUIERA":
-            m &= (b["_banco_norm"] == banco_rule)
-
-        if concepto:
-            m_con = m & (b["Concepto"].astype(str).str.strip() == "")
-            b.loc[m_con, "Concepto"] = concepto
-
-        if tipo:
-            m_tip = m & (b["Tipo"].astype(str).str.strip() == "")
-            b.loc[m_tip, "Tipo"] = tipo
-
-        # cuenta puede ser vacío (para ingresos/egresos sin cuenta)
-        m_cta = m & (b["Cuenta"].astype(str).str.strip() == "")
-        b.loc[m_cta, "Cuenta"] = cuenta
-
-    # ajuste solicitado: Rendimientos Fiducia es Tipo Ingreso
-    b.loc[
-        (b["_banco_norm"] == "FIDUCIA") &
-        (b["_detalle_norm"].str.startswith("RENDIMIENTOS FIDUCIA")),
-        "Tipo"
-    ] = "Ingreso"
-
-    b.drop(columns=["_banco_norm","_detalle_norm"], inplace=True)
-    return b
-
-
-# ==========================================================
 # Cruces
 # ==========================================================
 def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    b = bancos.reset_index().rename(columns={"index":"idx_banco"}).copy()
-    a = auxiliar.reset_index().rename(columns={"index":"idx_aux"}).copy()
+    b = bancos.reset_index(drop=True).reset_index().rename(columns={"index": "idx_banco"}).copy()
+    a = auxiliar.reset_index().rename(columns={"index": "idx_aux"}).copy()
 
     b["Fecha"] = pd.to_datetime(b["Fecha"], errors="coerce").dt.normalize()
     a["Fecha"] = pd.to_datetime(a["Fecha"], errors="coerce").dt.normalize()
@@ -587,7 +726,7 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
     if not b_nom.empty:
         log("Cruce Nómina Bancolombia por día…")
         grouped = b_nom.groupby("Fecha").agg(
-            Valor_total=("Valor","sum"),
+            Valor_total=("Valor", "sum"),
             idxs=("idx_banco", lambda s: list(s))
         ).reset_index()
 
@@ -611,7 +750,7 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
                 matched_b.add(int(ib))
             matched_a.add(ia)
 
-    # 2) BBVA CARGO DOMICILIA: banco vs suma diaria auxiliar egresos
+    # 2) BBVA CARGO DOMICILIA vs suma diaria auxiliar egresos
     tol_bbva = timedelta(days=cfg.tol_bbva_sum_days)
     bbva_cargo = b[
         (b["Banco"].str.upper() == "BBVA") &
@@ -622,7 +761,7 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
 
     if not bbva_cargo.empty:
         log("Cruce BBVA CARGO DOMICILIA vs suma diaria auxiliar…")
-        aux_bbva = a[(a["Banco"].str.upper()=="BBVA") & (a["Tipo"].str.upper()=="EGRESO") & (~a["idx_aux"].isin(matched_a))].copy()
+        aux_bbva = a[(a["Banco"].str.upper() == "BBVA") & (a["Tipo"].str.upper() == "EGRESO") & (~a["idx_aux"].isin(matched_a))].copy()
         sum_by_day = aux_bbva.groupby("Fecha")["Valor"].sum().round(2)
         day_to_idxs = aux_bbva.groupby("Fecha")["idx_aux"].apply(list).to_dict()
 
@@ -650,17 +789,17 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
 
     def cross_one_to_one(tipo: str):
         nonlocal matched_b, matched_a, links
-        bb = b[(b["Tipo"].str.upper()==tipo.upper()) & (~b["idx_banco"].isin(matched_b))].copy()
+        bb = b[(b["Tipo"].str.upper() == tipo.upper()) & (~b["idx_banco"].isin(matched_b))].copy()
         for _, rb in bb.iterrows():
             fb = rb["Fecha"]
             vb = float(rb["Valor"])
             banco = rb["Banco"].upper()
 
             cand = a[
-                (a["Banco"].str.upper()==banco) &
+                (a["Banco"].str.upper() == banco) &
                 (~a["idx_aux"].isin(matched_a)) &
-                (a["Tipo"].str.upper()==tipo.upper()) &
-                (a["Valor"].round(2)==round(vb,2)) &
+                (a["Tipo"].str.upper() == tipo.upper()) &
+                (a["Valor"].round(2) == round(vb, 2)) &
                 (a["Fecha"].between(fb - tol_gen, fb + tol_gen))
             ]
             if cand.empty:
@@ -673,8 +812,7 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
     cross_one_to_one("Ingreso")
     cross_one_to_one("Egreso")
 
-    cruce_df = pd.DataFrame(links, columns=["idx_banco","idx_aux","ReglaCruce"])
-
+    cruce_df = pd.DataFrame(links, columns=["idx_banco", "idx_aux", "ReglaCruce"])
     pend_b = b[~b["idx_banco"].isin(matched_b)].drop(columns=["idx_banco"])
     pend_a = a[~a["idx_aux"].isin(matched_a)].drop(columns=["idx_aux"])
 
@@ -682,33 +820,31 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
 
 
 # ==========================================================
-# documento en Bancos desde Auxiliar col C usando Cruce
+# documento en Bancos desde Auxiliar usando Cruce
 # ==========================================================
 def add_documento_column(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cruce_df: pd.DataFrame) -> pd.DataFrame:
     b = bancos.reset_index(drop=True).copy()
     a = auxiliar.reset_index(drop=True).copy()
 
-    # insertar "documento" en columna H (índice 7)
     if "documento" in b.columns:
         b = b.drop(columns=["documento"])
     b.insert(7, "documento", "")
 
     if cruce_df is None or cruce_df.empty:
         return b
-
-    if not {"idx_banco","idx_aux"}.issubset(cruce_df.columns):
+    if not {"idx_banco", "idx_aux"}.issubset(cruce_df.columns):
         return b
 
-    # Documento en Auxiliar columna C -> índice 2
-    aux_doc_col = a.columns[2]  # C
-    aux_idx = a.reset_index().rename(columns={"index":"idx_aux"})[["idx_aux", aux_doc_col]].rename(columns={aux_doc_col:"documento"})
+    aux_doc_col = a.columns[2]  # Documento
+    aux_idx = a.reset_index().rename(columns={"index": "idx_aux"})[["idx_aux", aux_doc_col]].rename(columns={aux_doc_col: "documento"})
     merged = cruce_df.merge(aux_idx, on="idx_aux", how="left")
 
     map_docs = (
         merged.groupby("idx_banco")["documento"]
-        .apply(lambda s: ",".join(sorted(set([x for x in s.dropna().astype(str) if x and x.lower()!="nan"]))))
+        .apply(lambda s: ",".join(sorted(set([x for x in s.dropna().astype(str) if x and x.lower() != "nan"]))))
         .to_dict()
     )
+
     for idx_b, doc in map_docs.items():
         try:
             b.loc[int(idx_b), "documento"] = doc
@@ -725,22 +861,16 @@ def run_pipeline(cfg: RunConfig, log) -> Dict[str, pd.DataFrame]:
         raise ValueError("Debe cargar Libro Auxiliar.")
     if not cfg.contables.balance_prueba_xlsx:
         raise ValueError("Debe cargar Balance de prueba.")
-    if not cfg.otros.reglas_xlsx:
-        raise ValueError("Debe cargar Reglas (Tipo/Cuenta/Concepto).")
 
     bancos = build_bancos(cfg, log)
     auxiliar = build_auxiliar(cfg.contables.libro_auxiliar_xlsx, cfg, log)
     verify_balance(cfg.contables.balance_prueba_xlsx, auxiliar, log)
 
-    rules = load_rules(cfg.otros.reglas_xlsx)
-    bancos = apply_rules_to_bancos(bancos, rules)
+    bancos = apply_embedded_rules_to_bancos(bancos)
 
     cruce_df, pend_b, pend_a = cruzar(bancos, auxiliar, cfg, log)
-
     bancos_final = add_documento_column(bancos, auxiliar, cruce_df)
 
-    # Ajuste: en la hoja Bancos usar columnas ordenadas (Banco, Fecha, Detalle, Valor, Tipo, Cuenta, Concepto, documento)
-    # Nota: documento está insertado en H; lo dejamos como está.
     return {
         "Bancos": bancos_final,
         "Auxiliar": auxiliar,
@@ -766,7 +896,7 @@ class FilePicker(QWidget):
         super().__init__()
         self.filter_str = filter_str
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(0,0,0,0)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         self.label = QLabel(title)
         self.label.setMinimumWidth(220)
@@ -803,16 +933,15 @@ class MainWindow(QMainWindow):
         lp = QHBoxLayout(gb_periodo)
 
         self.cmb_mes = QComboBox()
-        for m, n in [(1,"Enero"),(2,"Febrero"),(3,"Marzo"),(4,"Abril"),(5,"Mayo"),(6,"Junio"),
-                     (7,"Julio"),(8,"Agosto"),(9,"Septiembre"),(10,"Octubre"),(11,"Noviembre"),(12,"Diciembre")]:
+        for m, n in [(1, "Enero"), (2, "Febrero"), (3, "Marzo"), (4, "Abril"), (5, "Mayo"), (6, "Junio"),
+                     (7, "Julio"), (8, "Agosto"), (9, "Septiembre"), (10, "Octubre"), (11, "Noviembre"), (12, "Diciembre")]:
             self.cmb_mes.addItem(n, m)
         self.cmb_mes.setCurrentIndex(10)  # Nov
 
         self.sp_anio = QSpinBox()
-        self.sp_anio.setRange(2000,2100)
+        self.sp_anio.setRange(2000, 2100)
         self.sp_anio.setValue(2025)
 
-        # tolerancias
         self.sp_tol_nom = QSpinBox(); self.sp_tol_nom.setRange(0, 30); self.sp_tol_nom.setValue(5)
         self.sp_tol_gen = QSpinBox(); self.sp_tol_gen.setRange(0, 30); self.sp_tol_gen.setValue(3)
         self.sp_tol_bbva = QSpinBox(); self.sp_tol_bbva.setRange(0, 30); self.sp_tol_bbva.setValue(5)
@@ -847,7 +976,7 @@ class MainWindow(QMainWindow):
 
         self.fp_bog_mov = FilePicker("Bogotá - Movimientos (XLS)", "Excel (*.xls *.xlsx);;Todos (*.*)")
         self.fp_bog_inf = FilePicker("Bogotá - Informe (CSV)", "CSV (*.csv);;Todos (*.*)")
-        self.sp_bog_inf_year = QSpinBox(); self.sp_bog_inf_year.setRange(2000,2100); self.sp_bog_inf_year.setValue(2025)
+        self.sp_bog_inf_year = QSpinBox(); self.sp_bog_inf_year.setRange(2000, 2100); self.sp_bog_inf_year.setValue(2025)
 
         # Agrario: Movimiento/Informe
         self.rb_agr_mov = QRadioButton("Agrario Movimiento"); self.rb_agr_inf = QRadioButton("Agrario Informe")
@@ -867,7 +996,7 @@ class MainWindow(QMainWindow):
         lb.addWidget(QLabel("Rendimientos Fiducia:"), r, 0); lb.addWidget(self.ed_fid_rend, r, 1); r += 1
 
         bog_row = QWidget()
-        hb = QHBoxLayout(bog_row); hb.setContentsMargins(0,0,0,0)
+        hb = QHBoxLayout(bog_row); hb.setContentsMargins(0, 0, 0, 0)
         hb.addWidget(self.rb_bog_mov); hb.addWidget(self.rb_bog_inf); hb.addStretch(1)
         hb.addWidget(QLabel("Año Informe Bogotá:")); hb.addWidget(self.sp_bog_inf_year)
         lb.addWidget(bog_row, r, 0, 1, 2); r += 1
@@ -875,7 +1004,7 @@ class MainWindow(QMainWindow):
         lb.addWidget(self.fp_bog_inf, r, 0, 1, 2); r += 1
 
         agr_row = QWidget()
-        ha = QHBoxLayout(agr_row); ha.setContentsMargins(0,0,0,0)
+        ha = QHBoxLayout(agr_row); ha.setContentsMargins(0, 0, 0, 0)
         ha.addWidget(self.rb_agr_mov); ha.addWidget(self.rb_agr_inf); ha.addStretch(1)
         lb.addWidget(agr_row, r, 0, 1, 2); r += 1
         lb.addWidget(self.fp_agr_mov, r, 0, 1, 2); r += 1
@@ -896,10 +1025,8 @@ class MainWindow(QMainWindow):
         lo = QVBoxLayout(gb_otros)
         self.fp_aplicativo = FilePicker("Aplicativo", "Excel (*.xls *.xlsx);;Todos (*.*)")
         self.fp_criterios = FilePicker("Criterios bancarios", "Excel (*.xls *.xlsx);;Todos (*.*)")
-        self.fp_reglas = FilePicker("Reglas Tipo/Cuenta/Concepto (XLSX)", "Excel (*.xls *.xlsx);;Todos (*.*)")
         lo.addWidget(self.fp_aplicativo)
         lo.addWidget(self.fp_criterios)
-        lo.addWidget(self.fp_reglas)
 
         # Salida + botón
         gb_out = QGroupBox("Salida")
@@ -954,7 +1081,6 @@ class MainWindow(QMainWindow):
         mes = int(self.cmb_mes.currentData())
         anio = int(self.sp_anio.value())
 
-        # bancos
         banc = BankFiles()
         banc.bancolombia_csv = self.fp_bancolombia.get()
         banc.fiducia_csv = self.fp_fiducia.get()
@@ -964,20 +1090,17 @@ class MainWindow(QMainWindow):
         rend = self.ed_fid_rend.text().strip()
         banc.fiducia_rendimientos = float(rend) if rend else None
 
-        # bogota
         if self.rb_bog_mov.isChecked():
             banc.bogota_mov_xls = self.fp_bog_mov.get()
         else:
             banc.bogota_inf_csv = self.fp_bog_inf.get()
             banc.bogota_inf_year = int(self.sp_bog_inf_year.value())
 
-        # agrario
         if self.rb_agr_mov.isChecked():
             banc.agrario_mov_xls = self.fp_agr_mov.get()
         else:
             banc.agrario_inf_xls = self.fp_agr_inf.get()
 
-        # contables
         cont = AccountingFiles(
             balance_prueba_xlsx=self.fp_balance.get(),
             reporte_comprobantes_xlsx=self.fp_reporte.get(),
@@ -986,8 +1109,7 @@ class MainWindow(QMainWindow):
 
         otros = OtherFiles(
             aplicativo_xlsx=self.fp_aplicativo.get(),
-            criterios_bancarios_xlsx=self.fp_criterios.get(),
-            reglas_xlsx=self.fp_reglas.get()
+            criterios_bancarios_xlsx=self.fp_criterios.get()
         )
 
         cfg = RunConfig(
@@ -1024,8 +1146,6 @@ class MainWindow(QMainWindow):
             raise ValueError("Falta Libro Auxiliar.")
         if not cfg.contables.balance_prueba_xlsx:
             raise ValueError("Falta Balance de prueba.")
-        if not cfg.otros.reglas_xlsx:
-            raise ValueError("Falta archivo Reglas (Tipo/Cuenta/Concepto).")
 
     def on_run(self):
         self.log.clear()
