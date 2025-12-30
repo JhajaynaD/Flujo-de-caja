@@ -7,6 +7,8 @@ from calendar import monthrange
 from typing import Optional, Dict, Tuple, List
 
 import pandas as pd
+import numpy as np
+
 
 from PySide6.QtGui import QDoubleValidator
 from PySide6.QtWidgets import (
@@ -21,6 +23,16 @@ from PySide6.QtWidgets import (
 # ==========================================================
 # Helpers: parse dinero / fechas
 # ==========================================================
+def extract_ddmmyyyy_from_text(text: str) -> pd.Timestamp:
+    if pd.isna(text):
+        return pd.NaT
+    s = str(text)
+    m = re.search(r"\b(\d{2})/(\d{2})/(20\d{2})\b", s)
+    if not m:
+        return pd.NaT
+    d, mo, y = m.group(1), m.group(2), m.group(3)
+    return pd.to_datetime(f"{y}-{mo}-{d}", errors="coerce").normalize()
+
 def last_day_of_month(year: int, month: int) -> pd.Timestamp:
     return pd.Timestamp(datetime(year, month, monthrange(year, month)[1])).normalize()
 
@@ -172,10 +184,8 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         # BANCOLOMBIA - EGRESO (conceptos específicos)
         ("BANCOLOMBIA", "PAGO PSE IMPUESTO DIAN", "Egreso", "", "Impuestos"),
         ("BANCOLOMBIA", "PAGO PSE MUNICIPIO DE YUMBO", "Egreso", "", "Impuestos"),
-        ("BANCOLOMBIA", "PAGO A PROVE LOPEZ MORALES J", "Egreso", "", "Nomina"),
-        ("BANCOLOMBIA", "CARGUE TARJETA PREPAGO PROPIA", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "CARGUE TARJETA PREPAGO PROPIA", "Egreso", "", "Proveedores"),
         ("BANCOLOMBIA", "PAGO A PROV JGN BBVA AHORRO", "Egreso", "", "Nomina"),
-        ("BANCOLOMBIA", "PAGO A PROV UPEGUI NARANJO ADR", "Egreso", "", "Nomina"),
         ("BANCOLOMBIA", "PAGO PSE ASOPAGOS", "Egreso", "", "Nomina"),
         ("BANCOLOMBIA", "PAGO PSE BANCOLOMBIA", "Egreso", "", "Nomina"),
         ("BANCOLOMBIA", "PAGO A PROVE OPERADORA DE SE", "Egreso", "", "Nomina"),
@@ -194,9 +204,11 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         ("BANCOLOMBIA", "PAGO SUC VIRT TC VISA", "Egreso", "", "Credito"),
         ("BANCOLOMBIA", "PAGO AUTOM TC VISA", "Egreso", "", "Credito"),
         ("BANCOLOMBIA", "PAGO CREDITO SUC VIRTUAL", "Egreso", "", "Proveedores"),
-        ("BANCOLOMBIA", "PAGO SEGUROS GENERALES", "Egreso", "", "Nomina"),
+        ("BANCOLOMBIA", "PAGO SEGUROS GENERALES", "Egreso", "", "Proveedores"),
         ("BANCOLOMBIA", "PAGO SURAMERICANA DE SEGUROS", "Egreso", "", "Proveedores"),
         ("BANCOLOMBIA", "PAGO SV", "Egreso", "", "Proveedores"),
+        ("BANCOLOMBIA", "PAGO A PROV", "Egreso", "", "Proveedores"),
+        ("BANCOLOMBIA", "PAGO PSE", "Egreso", "", "Proveedores"),
 
         # BANCOLOMBIA (INGRESO)
         ("BANCOLOMBIA", "PAGO DE PROV", "Ingreso", "", "Bancolombia"),
@@ -341,6 +353,7 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         b["_detalle_norm"].str.contains(r"\bGMF\b", na=False) |
         b["_detalle_norm"].str.contains("IMPTO GOBIERNO 4X1000", na=False) |
         b["_detalle_norm"].str.contains("CARGO POR IMPUE", na=False) |
+        b["_detalle_norm"].str.contains("CORRECCION IMPT", na=False) |
         b["_detalle_norm"].str.contains("GRAVAMEN MOVIMIENTOS FINANCIEROS", na=False)
     )
     b.loc[m, "Tipo"] = "GB"
@@ -402,16 +415,82 @@ def load_bancolombia_csv(path: str) -> pd.DataFrame:
     out["Detalle"] = out["Detalle"].replace({"nan": None, "NaN": None, "": None})
     return out.dropna(subset=["Fecha", "Detalle"])
 
+def parse_spanish_date(s):
+    if pd.isna(s):
+        return pd.NaT
+    s = str(s).strip().lstrip("\ufeff")
+    s = re.sub(r"\s+", " ", s)
+
+    months = {
+        "ene": "01", "feb": "02", "mar": "03", "abr": "04", "may": "05", "jun": "06",
+        "jul": "07", "ago": "08", "sep": "09", "set": "09", "oct": "10", "nov": "11", "dic": "12"
+    }
+
+    m = re.match(r"(\d{1,2})\s*([A-Za-zñÑ]{3,})\s*(\d{4})", s)
+    if m:
+        d, mon, y = m.group(1), m.group(2).lower()[:3], m.group(3)
+        if mon in months:
+            return pd.to_datetime(f"{y}-{months[mon]}-{int(d):02d}", errors="coerce")
+
+    return pd.to_datetime(s, errors="coerce", dayfirst=True)
+
+def parse_reporte_fecha(x):
+    """
+    Soporta:
+    - 'Dic/01/2025' (mes en español)
+    - 'Dec/01/2025' (mes en inglés)
+    - fechas normales tipo 2025-12-01 o 01/12/2025
+    """
+    if pd.isna(x):
+        return pd.NaT
+
+    s = str(x).strip().lstrip("\ufeff")
+    if not s:
+        return pd.NaT
+
+    # Caso tipo 'Dic/01/2025'
+    m = re.match(r"^([A-Za-zñÑ]{3})/(\d{2})/(\d{4})$", s)
+    if m:
+        mon = m.group(1).lower()
+        d = m.group(2)
+        y = m.group(3)
+
+        meses = {
+            "ene":"01","feb":"02","mar":"03","abr":"04","may":"05","jun":"06",
+            "jul":"07","ago":"08","sep":"09","set":"09","oct":"10","nov":"11","dic":"12",
+            "jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+            "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"
+        }
+
+        if mon in meses:
+            return pd.to_datetime(f"{y}-{meses[mon]}-{d}", errors="coerce").normalize()
+
+    # Fallback: intenta parseo normal
+    dt = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        dt = pd.to_datetime(s, errors="coerce", dayfirst=False)
+    return pd.Timestamp(dt).normalize() if not pd.isna(dt) else pd.NaT
+
+
 
 def load_fiducia_csv(path: str, anio: int, mes: int, rendimientos: float) -> pd.DataFrame:
-    df = pd.read_csv(path, sep=";", dtype=str, encoding_errors="ignore")
-    df.columns = [c.strip() for c in df.columns]
+    df = pd.read_csv(
+        path,
+        sep=";",
+        dtype=str,
+        encoding="utf-8-sig",   # <- maneja BOM
+        engine="python"
+    )
+
+    df.columns = [c.strip().lstrip("\ufeff") for c in df.columns]
+    df = df.loc[:, [c for c in df.columns if c and not c.lower().startswith("unnamed")]]
+
     cols = list(df.columns)
     fecha_col = cols[0]
     valor_col = "VALOR" if "VALOR" in cols else cols[-1]
     det_col = "DESCRIPCION" if "DESCRIPCION" in cols else (cols[1] if len(cols) > 1 else cols[0])
 
-    df["Fecha"] = pd.to_datetime(df[fecha_col], errors="coerce", dayfirst=True).dt.normalize()
+    df["Fecha"] = df[fecha_col].apply(parse_spanish_date).dt.normalize()
     df["Detalle"] = df[det_col].astype(str).str.strip()
     df["Valor"] = df[valor_col].apply(to_float_money)
 
@@ -425,7 +504,9 @@ def load_fiducia_csv(path: str, anio: int, mes: int, rendimientos: float) -> pd.
         "Detalle": "Rendimientos Fiducia",
         "Valor": float(rendimientos)
     }])
+
     return pd.concat([out, rend_row], ignore_index=True)
+
 
 
 def load_bogota_mov_xls(path: str) -> pd.DataFrame:
@@ -756,6 +837,40 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
                 links.append((int(ib), ia, "NOMINA_DIA_TOL"))
                 matched_b.add(int(ib))
             matched_a.add(ia)
+        # 1.2) PROVEEDORES Bancolombia: agrupar por día en bancos y cruzar contra un solo egreso en auxiliar
+    tol_prov = timedelta(days=cfg.tol_nomina_days)  # puedes usar otra tolerancia si quieres
+    prov_mask = (b["Banco"].str.upper() == "BANCOLOMBIA") & (
+        b["Detalle"].astype(str).str.upper().str.startswith(("PAGO A PROV", "PAGO A PROVE"))
+    )
+    b_prov = b[prov_mask & (~b["idx_banco"].isin(matched_b))].copy()
+
+    if not b_prov.empty:
+        log("Cruce Proveedores Bancolombia por día (SUMA)…")
+        grouped = b_prov.groupby("Fecha").agg(
+            Valor_total=("Valor", "sum"),
+            idxs=("idx_banco", lambda s: list(s))
+        ).reset_index()
+
+        for _, r in grouped.iterrows():
+            f = r["Fecha"]
+            v = round(float(r["Valor_total"]), 2)
+
+            cand = a[
+                (a["Banco"].str.upper() == "BANCOLOMBIA") &
+                (a["Tipo"].str.upper() == "EGRESO") &
+                (~a["idx_aux"].isin(matched_a)) &
+                (a["Valor"].round(2) == v) &
+                (a["Fecha"].between(f - tol_prov, f + tol_prov))
+            ]
+            if cand.empty:
+                continue
+
+            ia = int(cand.iloc[0]["idx_aux"])
+            for ib in r["idxs"]:
+                links.append((int(ib), ia, "PROVEEDORES_SUMDIA"))
+                matched_b.add(int(ib))
+            matched_a.add(ia)
+
 
     # 2) BBVA CARGO DOMICILIA vs suma diaria auxiliar egresos
     tol_bbva = timedelta(days=cfg.tol_bbva_sum_days)
@@ -793,28 +908,143 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
 
     # 3) Cruce general: por valor, banco y tipo con tolerancia ± tol_general
     tol_gen = timedelta(days=cfg.tol_general_days)
+    # =========================
+    # REGLA: DISPERSIÓN PROVEEDORES BANCOLOMBIA
+    # MUCHOS BANCOS -> UN AUXILIAR
+    # =========================
+    log("Cruce dispersión proveedores Bancolombia…")
+
+    b_prov = b[
+        (b["Banco"].str.upper() == "BANCOLOMBIA") &
+        (~b["idx_banco"].isin(matched_b)) &
+        (b["Tipo"].str.upper() == "EGRESO") &
+        (b["Detalle"].astype(str).str.upper().str.startswith("PAGO A PROV"))
+    ].copy()
+
+    if not b_prov.empty:
+        for fecha, grp in b_prov.groupby("Fecha"):
+            total_bancos = round(grp["Valor"].sum(), 2)
+
+            # buscar egreso único en auxiliar ese día por el mismo total
+            cand_aux = a[
+                (a["Banco"].str.upper() == "BANCOLOMBIA") &
+                (~a["idx_aux"].isin(matched_a)) &
+                (a["Tipo"].str.upper() == "EGRESO") &
+                (a["Fecha"] == fecha) &
+                (a["Valor"].round(2) == total_bancos)
+            ]
+
+            if cand_aux.empty:
+                continue
+
+            # debe ser UNO (como RIO CLARO)
+            ra = cand_aux.iloc[0]
+            ia = int(ra["idx_aux"])
+
+            for ib in grp["idx_banco"]:
+                links.append((int(ib), ia, "DISPERSION_PROVEEDORES"))
+                matched_b.add(int(ib))
+
+            matched_a.add(ia)
+    # ========================= PASO X =========================
+        # X) Auxiliar INGRESO no cruzado: si el detalle trae fecha dd/mm/yyyy, cruzar contra Bancos por esa fecha exacta
+    log("Cruce extra: Auxiliar Ingresos con fecha embebida en Detalle (dd/mm/yyyy)…")
+
+    # candidatos: auxiliar ingreso, no cruzado todavía, y que tenga dd/mm/yyyy en el detalle
+    a_ing = a[
+        (a["Tipo"].str.upper() == "INGRESO") &
+        (~a["idx_aux"].isin(matched_a))
+    ].copy()
+
+    if not a_ing.empty:
+        a_ing["FechaDet"] = a_ing["Detalle"].apply(extract_ddmmyyyy_from_text)
+
+        a_ing = a_ing.dropna(subset=["FechaDet"])
+        if not a_ing.empty:
+            for _, ra in a_ing.iterrows():
+                fa = ra["FechaDet"]
+                va = round(float(ra["Valor"]), 2)
+                banco = str(ra["Banco"]).upper()
+
+                # buscamos en bancos: mismo banco, mismo valor, misma fecha (o con tolerancia general)
+                cand_b = b[
+                    (b["Banco"].str.upper() == banco) &
+                    (~b["idx_banco"].isin(matched_b)) &
+                    (b["Tipo"].str.upper() == "INGRESO") &
+                    (b["Valor"].round(2) == va) &
+                    (b["Fecha"].between(fa - tol_gen, fa + tol_gen))
+                ].copy()
+
+                if cand_b.empty:
+                    continue
+
+                # escoger el más cercano
+                cand_b["_df"] = (cand_b["Fecha"] - fa).abs()
+                cand_b = cand_b.sort_values(["_df", "idx_banco"])
+                ib = int(cand_b.iloc[0]["idx_banco"])
+                ia = int(ra["idx_aux"])
+
+                links.append((ib, ia, "AUX_FECHA_EN_DETALLE"))
+                matched_b.add(ib)
+                matched_a.add(ia)
 
     def cross_one_to_one(tipo: str):
         nonlocal matched_b, matched_a, links
-        bb = b[(b["Tipo"].str.upper() == tipo.upper()) & (~b["idx_banco"].isin(matched_b))].copy()
+
+        tipo_u = tipo.upper()
+
+        # === PASO 1: Fecha exacta ===
+        bb = b[(b["Tipo"].str.upper() == tipo_u) & (~b["idx_banco"].isin(matched_b))].copy()
+
         for _, rb in bb.iterrows():
             fb = rb["Fecha"]
             vb = float(rb["Valor"])
-            banco = rb["Banco"].upper()
+            banco = str(rb["Banco"]).upper()
 
             cand = a[
                 (a["Banco"].str.upper() == banco) &
                 (~a["idx_aux"].isin(matched_a)) &
-                (a["Tipo"].str.upper() == tipo.upper()) &
+                (a["Tipo"].str.upper() == tipo_u) &
+                (a["Valor"].round(2) == round(vb, 2)) &
+                (a["Fecha"] == fb)  # ✅ prioridad: misma fecha
+            ]
+
+            if cand.empty:
+                continue
+
+            ia = int(cand.sort_values(["idx_aux"]).iloc[0]["idx_aux"])
+            links.append((int(rb["idx_banco"]), ia, f"{tipo_u}_FECHA_EXACTA"))
+            matched_b.add(int(rb["idx_banco"]))
+            matched_a.add(ia)
+
+        # === PASO 2: Con tolerancia (solo pendientes) ===
+        bb2 = b[(b["Tipo"].str.upper() == tipo_u) & (~b["idx_banco"].isin(matched_b))].copy()
+
+        for _, rb in bb2.iterrows():
+            fb = rb["Fecha"]
+            vb = float(rb["Valor"])
+            banco = str(rb["Banco"]).upper()
+
+            cand = a[
+                (a["Banco"].str.upper() == banco) &
+                (~a["idx_aux"].isin(matched_a)) &
+                (a["Tipo"].str.upper() == tipo_u) &
                 (a["Valor"].round(2) == round(vb, 2)) &
                 (a["Fecha"].between(fb - tol_gen, fb + tol_gen))
             ]
+
             if cand.empty:
                 continue
+
+            cand = cand.copy()
+            cand["_df"] = (cand["Fecha"] - fb).abs()
+            cand = cand.sort_values(["_df", "idx_aux"])
             ia = int(cand.iloc[0]["idx_aux"])
-            links.append((int(rb["idx_banco"]), ia, f"{tipo.upper()}_TOL"))
+
+            links.append((int(rb["idx_banco"]), ia, f"{tipo_u}_TOL"))
             matched_b.add(int(rb["idx_banco"]))
             matched_a.add(ia)
+
 
     cross_one_to_one("Ingreso")
     cross_one_to_one("Egreso")
@@ -859,6 +1089,715 @@ def add_documento_column(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cruce_df:
             pass
     return b
 
+    # ==========================================================
+# COMPROBANTES (Reporte movimiento por comprobante) -> Hoja "Comprobante"
+# ==========================================================
+
+def s(x) -> str:
+    return "" if pd.isna(x) else str(x).strip()
+
+def nit_clean(n) -> str:
+    t = s(n).replace(".", "").replace(" ", "")
+    if "-" in t:
+        return t.split("-", 1)[0]
+    return "".join(c for c in t if c.isdigit())
+
+def normalize_docto_ref(x) -> str:
+    """
+    Remove dots and prepend one zero per removed dot.
+    Example: 10882820330000000.1 -> 0108828203300000001
+    """
+    t = s(x)
+    if not t:
+        return ""
+    dot_count = t.count(".")
+    return ("0" * dot_count) + t.replace(".", "")
+
+def right9_pad_text(x) -> str:
+    """
+    Excel-like: REPETIR(0,9-LARGO(DERECHA(x,9)))&DERECHA(x,9)
+    Treat as text: take last 9 chars and pad left zeros to 9.
+    """
+    t = s(x)
+    if not t:
+        return ""
+    return t[-9:].zfill(9)
+
+def tipo_pago(det) -> str:
+    return "Abono" if "abono" in s(det).lower() else "Pago Total"
+
+
+def build_comprobante_and_no_cruzan(reporte_comprobantes_path: str, aplicativo_path: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    mov = pd.read_excel(reporte_comprobantes_path, header=2)
+    rio = pd.read_excel(aplicativo_path)
+    
+    def set_if_empty(df, mask, col, value):
+        """Asigna value en col solo si col está vacío (strip == '')."""
+        empty = df[col].fillna("").astype(str).str.strip().eq("")
+        df.loc[mask & empty, col] = value
+
+    # ---------- COMPROBANTES ----------
+    mov["Cuenta"] = mov["Cuenta"].astype(str).str.strip()
+    mov["NIT"] = mov["NIT"].apply(nit_clean)
+    mov["Documento"] = pd.to_numeric(mov["Documento"], errors="coerce")
+    mov["Comprobante"] = pd.to_numeric(mov["Comprobante"], errors="coerce")
+    mov["Fecha de pago"] = mov["Fecha"].apply(parse_reporte_fecha)
+
+
+    mov["DoctoRef_norm"] = mov["Docto. Referencia"].apply(normalize_docto_ref)
+    mov["Criterio"] = mov["NIT"] + mov["DoctoRef_norm"]
+
+    mov["N° de egreso"] = (
+        mov["Comprobante"].fillna(0).astype(int).astype(str)
+        + "-"
+        + mov["Documento"].fillna(0).astype(int).astype(str)
+        + "-"
+        + mov["Fecha de pago"].dt.month.fillna(0).astype(int).astype(str)
+    )
+
+    bank_map = {
+        "11-10-05-04": "B07",
+        "11-10-05-03": "B01",
+        "11-10-05-07": "B40",
+        "11-20-05-05": "B13",
+        "11-10-05-05": "B51",
+    }
+    priority = [
+        "11-10-05-04",
+        "11-10-05-03",
+        "11-10-05-07",
+        "11-20-05-05",
+        "11-10-05-05",
+        "23-55-05-08",  # -> ANC
+    ]
+
+    def banco_doc(doc):
+        if pd.isna(doc):
+            return ""
+        sub = mov.loc[mov["Documento"] == doc, "Cuenta"].astype(str).str.strip()
+
+        for acc in priority:
+            if (sub == acc).any():
+                return "ANC" if acc == "23-55-05-08" else bank_map.get(acc, "")
+
+        if sub.str.startswith("13-30", na=False).any():
+            return "ANTICIPO"
+        if sub.str.startswith("13-05", na=False).any():
+            return "CXC"
+
+        uniq = set(sub.dropna().unique().tolist())
+        if uniq and uniq.issubset({"22-05-01"}):
+            return "NC"
+
+        return ""
+
+    mov["Banco"] = mov["Documento"].apply(banco_doc)
+    mov["X"] = np.where(mov["Banco"].astype(str).str.startswith("B", na=False), "Bco", "Cruce")
+    mov["Tipo de Pago"] = mov["Detalle"].apply(tipo_pago)
+    # --- Vlr Pagado = Débito - Crédito ---
+    deb = pd.to_numeric(mov["Débito"], errors="coerce").fillna(0.0)
+    cred_col = "Crédito" if "Crédito" in mov.columns else ("Credito" if "Credito" in mov.columns else None)
+    cred = pd.to_numeric(mov[cred_col], errors="coerce").fillna(0.0) if cred_col else 0.0
+
+    mov["Vlr Pagado"] = (deb - cred).astype(float)
+
+
+    # --- Excluir cuentas de banco (no las necesito en la hoja Comprobante) ---
+    mov["Cuenta"] = mov["Cuenta"].astype(str).str.strip()
+
+    BANK_ACCOUNTS_EXCLUDE = {
+        "11-10-05-04",
+        "11-10-05-03",
+        "11-10-05-07",
+        "11-20-05-05",
+        "11-10-05-05",
+        "12-45-05",
+    }
+
+    mask_bco = mov["X"].astype(str).str.strip().eq("Bco")
+
+    mask_no_banco = (
+        ~mov["Cuenta"].isin(BANK_ACCOUNTS_EXCLUDE)
+        & ~mov["Cuenta"].str.startswith("11-10-05", na=False)
+        & ~mov["Cuenta"].str.startswith("11-20-05", na=False)
+    )
+
+    # ✅ Base final: documentos Bco (INCLUYENDO cuentas bancarias)
+    base = mov[mask_bco].copy()
+
+    
+    base = base[
+        [
+            "Criterio", "N° de egreso", "X", "Banco", "Cuenta", "Fecha de pago", "Documento",
+            "Docto. Referencia", "Detalle", "NIT", "Nombre NIT", "Tipo de Pago", "Vlr Pagado",
+        ]
+    ]
+
+    # ---------- APLICATIVO ----------
+    rio["nitEmpresa"] = rio["nitEmpresa"].apply(nit_clean)
+    rio["NFactura_norm"] = rio["NFactura"].apply(right9_pad_text)
+    rio["criterio_key"] = rio["nitEmpresa"] + rio["NFactura_norm"]
+
+    for c in ["FechaFactura", "FechaVencimientoFactura", "fechaAprobacion"]:
+        if c in rio.columns:
+            rio[c] = pd.to_datetime(rio[c], errors="coerce")
+
+    aprob_col = "usuarioAprobador" if "usuarioAprobador" in rio.columns else None
+    if aprob_col is None:
+        possible_aprob_cols = [c for c in rio.columns if "aprob" in c.lower() and ("por" in c.lower() or "user" in c.lower() or "usuario" in c.lower())]
+        aprob_col = possible_aprob_cols[0] if possible_aprob_cols else None
+
+
+    cols_rio = ["criterio_key", "nitEmpresa", "FechaFactura", "FechaVencimientoFactura", "fechaAprobacion", "carpeta"]
+    if aprob_col and aprob_col not in cols_rio:
+        cols_rio.append(aprob_col)
+
+    final = base.merge(
+        rio[cols_rio],
+        left_on="Criterio",
+        right_on="criterio_key",
+        how="left",
+    )
+
+    # Normalizar aprobador
+    final["AprobadoPor"] = final[aprob_col].astype(str).str.strip().str.lower() if aprob_col else ""
+
+
+    final["F Fra"] = final["FechaFactura"]
+    final["F. VTO"] = final["FechaVencimientoFactura"]
+    final["F. Aprobacion"] = final["fechaAprobacion"]
+    final["Carpeta"] = final["carpeta"]
+    # =========================
+    # NUEVAS COLUMNAS
+    # =========================
+    final["Concepto"] = "PROVEEDOR"
+    final["Rubro"] = ""
+    final["NOTAS"] = ""
+
+    final["Carpeta"] = final["Carpeta"].fillna("").astype(str).str.strip()
+    final["NIT"] = final["NIT"].astype(str).str.strip()
+    final["Cuenta"] = final["Cuenta"].fillna("").astype(str).str.strip()
+    final["Vlr Pagado"] = pd.to_numeric(final["Vlr Pagado"], errors="coerce").fillna(0.0)
+    
+    # ==========================================================
+    # REGLA: EGRESOS SOLO CON CUENTAS BANCARIAS => TRASLADO
+    # (11-10*, 11-20*, 12-45*)
+    # ==========================================================
+
+    final["Cuenta"] = final["Cuenta"].fillna("").astype(str).str.strip()
+    final["N° de egreso"] = final["N° de egreso"].fillna("").astype(str).str.strip()
+
+    bank_prefixes = ("11-10", "11-20", "12-45")
+    is_bank_cta = final["Cuenta"].str.startswith(bank_prefixes, na=False)
+
+    # Para cada N° de egreso, validar que TODAS sus cuentas sean bancarias
+    only_bank_egreso = final.groupby("N° de egreso")["Cuenta"].transform(
+        lambda s: s.fillna("").astype(str).str.strip().str.startswith(bank_prefixes).all()
+    )
+
+    m_traslado = (final["N° de egreso"].ne("")) & only_bank_egreso
+
+    # Aplicar regla (fuerte)
+    final.loc[m_traslado, "Carpeta"] = "N/A"
+    final.loc[m_traslado, "Concepto"] = "Traslado"
+    final.loc[m_traslado, "Rubro"] = "Traslado"
+
+    # ==========================================================
+    # REGLA ESPECIAL: 23-55-05-08 con valor positivo
+    # ==========================================================
+    m_alberto = (
+        final["Cuenta"].eq("23-55-05-08") &
+        (final["Vlr Pagado"] > 0)
+    )
+
+    final.loc[m_alberto, "Carpeta"] = "N/A"
+    final.loc[m_alberto, "Concepto"] = "Alberto Naranjo"
+    final.loc[m_alberto, "Rubro"] = "Alberto Naranjo"
+
+    
+    # ==========================================================
+    # REGLAS: Nómina / Impuestos / Heredar Concepto-Rubro por egreso
+    # ==========================================================
+
+    # --- Nómina ---
+    m_nomina = final["Cuenta"].str.startswith(("13-65", "23-70", "25-05"), na=False)
+    final.loc[m_nomina, "Concepto"] = "Nomina"
+    final.loc[m_nomina, "Rubro"] = "Salario"
+
+    # --- Impuestos ---
+    m_236x = final["Cuenta"].str.startswith(("23-65", "23-67", "23-68"), na=False)
+    final.loc[m_236x, "Concepto"] = "Impuestos"
+    final.loc[m_236x, "Rubro"] = "Contabilidad"
+
+    # --- Heredar Concepto/Rubro según N° de egreso ---
+    # Para cuentas 42-95-81, 53-05-25, 53-95-95-01, 42-10-20, 53-05-95-04:
+    # poner el mismo Concepto/Rubro que ya tenga el egreso (primera ocurrencia no vacía).
+    targets = {"42-95-81", "53-05-25", "53-95-95-01", "42-10-20","53-05-95-04"}
+
+    # normalizar para comparar
+    final["_cta_norm"] = final["Cuenta"].astype(str).str.strip()
+
+    # mapa por egreso -> (Concepto, Rubro) tomando el primer no vacío
+    tmp = final.copy()
+    tmp["_Concepto"] = tmp["Concepto"].fillna("").astype(str).str.strip()
+    tmp["_Rubro"] = tmp["Rubro"].fillna("").astype(str).str.strip()
+
+    base_map = (
+        tmp.loc[(tmp["_Concepto"] != "") | (tmp["_Rubro"] != ""), ["N° de egreso", "_Concepto", "_Rubro"]]
+        .drop_duplicates(subset=["N° de egreso"], keep="first")
+        .set_index("N° de egreso")
+    )
+
+    m_targets = final["_cta_norm"].isin(targets)
+
+    final.loc[m_targets, "Concepto"] = final.loc[m_targets, "N° de egreso"].map(base_map["_Concepto"]).fillna(final.loc[m_targets, "Concepto"])
+    final.loc[m_targets, "Rubro"]    = final.loc[m_targets, "N° de egreso"].map(base_map["_Rubro"]).fillna(final.loc[m_targets, "Rubro"])
+
+    final.drop(columns=["_cta_norm"], inplace=True, errors="ignore")
+
+    # ==========================================================
+    # REGLA: Créditos (21-05-15 / 21-05-16) y arrastre a 53-05
+    # ==========================================================
+
+    final["Cuenta"] = final["Cuenta"].fillna("").astype(str).str.strip()
+
+    # 0) EXCEPCIÓN: 21-05-15-01 => PROVEEDOR / Administrativo
+    m_21051501 = final["Cuenta"].eq("21-05-15-01")
+    final.loc[m_21051501, "Concepto"] = "PROVEEDOR"
+    final.loc[m_21051501, "Rubro"] = "Administrativo"
+
+    # 1) Regla general: Si empieza por 21-05-15 o 21-05-16 => Credito
+    #    (pero EXCLUYE 21-05-15-01)
+    m_credito = final["Cuenta"].str.startswith(("21-05-15", "21-05-16"), na=False) & (~m_21051501)
+    final.loc[m_credito, "Concepto"] = "Credito"
+    final.loc[m_credito, "Rubro"] = "Credito"
+
+    # 2) Si dentro del mismo N° de egreso hay alguna 21-05-15/16 (incluye 21-05-15-01),
+    #    entonces cualquier cuenta que empiece por 53-05 en ese mismo egreso
+    #    también queda con Concepto/Rubro = Credito
+    m_cualquier_credito = final["Cuenta"].str.startswith(("21-05-15", "21-05-16"), na=False)
+    egresos_con_credito = set(final.loc[m_cualquier_credito, "N° de egreso"].dropna().astype(str).unique())
+
+    m_5305_mismo_egreso = (
+        final["N° de egreso"].astype(str).isin(egresos_con_credito)
+        & final["Cuenta"].str.startswith("53-05", na=False)
+    )
+
+    final.loc[m_5305_mismo_egreso, "Concepto"] = "Credito"
+    final.loc[m_5305_mismo_egreso, "Rubro"] = "Credito"
+
+
+    # ==========================================================
+    # REGLAS CUENTAS 13-30-xx (incluye 13-30-05 con prioridad por Detalle)
+    # ==========================================================
+    final["Detalle"] = final["Detalle"].fillna("").astype(str)
+    final["Cuenta"]  = final["Cuenta"].fillna("").astype(str).str.strip()
+
+    # 13-30-18* => Comercial
+    m = final["Cuenta"].str.startswith("13-30-18", na=False)
+    final.loc[m, "Concepto"] = "PROVEEDOR"
+    final.loc[m, "Rubro"] = "Comercial"
+    
+        # 28-05-05* => Comercial
+    m = final["Cuenta"].str.startswith("28-05-05", na=False)
+    final.loc[m, "Concepto"] = "PROVEEDOR"
+    final.loc[m, "Rubro"] = "Comercial"
+
+    # 13-30-20* => Abastecimiento
+    m = final["Cuenta"].str.startswith("13-30-20", na=False)
+    final.loc[m, "Concepto"] = "PROVEEDOR"
+    final.loc[m, "Rubro"] = "Abastecimiento"
+
+    # 13-30-25* => Dividendos
+    m = final["Cuenta"].str.startswith("13-30-25", na=False)
+    final.loc[m, "Concepto"] = "PROVEEDOR"
+    final.loc[m, "Rubro"] = "Dividendos"
+
+    # --------------------------
+    # 13-30-05 => PRIORIZA Detalle
+    # --------------------------
+    m_133005 = final["Cuenta"].eq("13-30-05")
+    det = final.loc[m_133005, "Detalle"].str.upper().str.strip()
+
+    # OJO: aquí sí asignamos directo porque esta es la prioridad #1
+    final.loc[m_133005, "Concepto"] = "PROVEEDOR"
+
+    m_op    = m_133005.copy(); m_op[m_133005] = det.str.contains(r"^OP\s*-\s*", regex=True, na=False)
+    m_log   = m_133005.copy(); m_log[m_133005] = det.str.contains(r"^LOG\s*-\s*", regex=True, na=False)
+    m_admon = m_133005.copy(); m_admon[m_133005] = det.str.contains(r"^ADMON\s*-\s*", regex=True, na=False)
+    m_lab   = m_133005.copy(); m_lab[m_133005] = det.str.contains(r"^(LAB|SG)\s*-\s*", regex=True, na=False)
+    m_mp    = m_133005.copy(); m_mp[m_133005] = det.str.contains(r"^(MP|EMP)\s*-\s*", regex=True, na=False)
+    m_mer   = m_133005.copy(); m_mer[m_133005] = det.str.contains(r"^MER\s*-\s*", regex=True, na=False)
+    m_gh   = m_133005.copy(); m_gh[m_133005] = det.str.contains(r"^GH|SST\s*-\s*", regex=True, na=False)
+
+    final.loc[m_op,    "Rubro"] = "Operaciones y mantenimiento"
+    final.loc[m_log,   "Rubro"] = "Logistica"
+    final.loc[m_admon, "Rubro"] = "Administrativo"
+    final.loc[m_lab,   "Rubro"] = "SG-Laboratorio"
+    final.loc[m_mp,    "Rubro"] = "MP-Empaque"
+    final.loc[m_mer,   "Rubro"] = "Comercial"
+    final.loc[m_gh,    "Rubro"] = "GH-SST"
+    
+    # ==========================================================
+    # PASO 2 (13-30-05): Si NO cruza, heredar Concepto/Rubro del mismo N° de egreso
+    # ==========================================================
+    m_133005_no_cruza = final["Cuenta"].eq("13-30-05") & final["F Fra"].isna()
+    if m_133005_no_cruza.any():
+        key = "N° de egreso"
+
+    # --------------------------
+    # 13-30-95-01 => PRIORIZA Detalle
+    # --------------------------
+    m_13309501 = final["Cuenta"].eq("13-30-95-01")
+    det = final.loc[m_13309501, "Detalle"].str.upper().str.strip()
+
+    # OJO: aquí sí asignamos directo porque esta es la prioridad #1
+    final.loc[m_13309501, "Concepto"] = "PROVEEDOR"
+    m_op    = m_13309501.copy(); m_op[m_13309501] = det.str.contains(r"^OP\s*-\s*", regex=True, na=False)
+    m_log   = m_13309501.copy(); m_log[m_13309501] = det.str.contains(r"^LOG\s*-\s*", regex=True, na=False)
+    m_admon = m_13309501.copy(); m_admon[m_13309501] = det.str.contains(r"^ADMON\s*-\s*", regex=True, na=False)
+    m_lab   = m_13309501.copy(); m_lab[m_13309501] = det.str.contains(r"^(LAB|SG)\s*-\s*", regex=True, na=False)
+    m_mp    = m_13309501.copy(); m_mp[m_13309501] = det.str.contains(r"^(MP|EMP)\s*-\s*", regex=True, na=False)
+    m_mer   = m_13309501.copy(); m_mer[m_13309501] = det.str.contains(r"^MER\s*-\s*", regex=True, na=False)
+    m_gh   = m_13309501.copy(); m_gh[m_13309501] = det.str.contains(r"^GH|SST\s*-\s*", regex=True, na=False)
+
+    final.loc[m_op,    "Rubro"] = "Operaciones y mantenimiento"
+    final.loc[m_log,   "Rubro"] = "Logistica"
+    final.loc[m_admon, "Rubro"] = "Administrativo"
+    final.loc[m_lab,   "Rubro"] = "SG-Laboratorio"
+    final.loc[m_mp,    "Rubro"] = "MP-Empaque"
+    final.loc[m_mer,   "Rubro"] = "Comercial"
+    final.loc[m_gh,    "Rubro"] = "GH-SST"
+    
+    # ==========================================================
+    # PASO 2 (13-30-95-01): Si NO cruza, heredar Concepto/Rubro del mismo N° de egreso
+    # ==========================================================
+    m_13309501_no_cruza = final["Cuenta"].eq("13-30-95-01") & final["F Fra"].isna()
+    if m_13309501_no_cruza.any():
+        key = "N° de egreso"
+        
+        # Donantes: cualquier fila del mismo egreso con Rubro/Concepto útil
+        donors = final.loc[
+            (final[key].notna()) &
+            (final["Rubro"].fillna("").astype(str).str.strip().ne("") |
+            final["Concepto"].fillna("").astype(str).str.strip().ne("")),
+            [key, "Concepto", "Rubro"]
+        ].copy()
+
+        donors["Concepto"] = donors["Concepto"].fillna("").astype(str).str.strip()
+        donors["Rubro"]    = donors["Rubro"].fillna("").astype(str).str.strip()
+
+        # Priorizar donante con Rubro lleno
+        donors["_score"] = (donors["Rubro"].ne("")).astype(int) * 2 + (donors["Concepto"].ne("")).astype(int)
+        donors = donors.sort_values([key, "_score"], ascending=[True, False]).drop_duplicates(subset=[key], keep="first")
+        don_map = donors.set_index(key)[["Concepto", "Rubro"]]
+
+        # Solo copiar si está vacío (para respetar prioridad #1)
+        set_if_empty(final, m_133005_no_cruza, "Concepto", final.loc[m_133005_no_cruza, key].map(don_map["Concepto"]))
+        set_if_empty(final, m_133005_no_cruza, "Rubro",    final.loc[m_133005_no_cruza, key].map(don_map["Rubro"]))
+
+        final.drop(columns=["_score"], inplace=True, errors="ignore")
+        
+    # ==========================================================
+    # REGLA: TRASLADOS vs NO TRASLADOS (manejo de cuentas banco)
+    # ==========================================================
+
+    final["Cuenta"] = final["Cuenta"].fillna("").astype(str).str.strip()
+    final["N° de egreso"] = final["N° de egreso"].fillna("").astype(str).str.strip()
+
+    bank_prefixes = ("11-10", "11-20", "12-45")
+
+    # Marca si la fila es cuenta bancaria
+    final["_is_bank"] = final["Cuenta"].str.startswith(bank_prefixes, na=False)
+
+    # Para cada egreso: ¿todas las cuentas son bancarias?
+    egreso_solo_banco = final.groupby("N° de egreso")["_is_bank"].transform("all")
+
+    # -----------------------------
+    # CASO 1: SÍ ES TRASLADO
+    # -----------------------------
+    m_traslado = egreso_solo_banco & final["N° de egreso"].ne("")
+
+    final.loc[m_traslado, "Carpeta"] = "N/A"
+    final.loc[m_traslado, "Concepto"] = "Traslado"
+    final.loc[m_traslado, "Rubro"] = "Traslado"
+
+    # -----------------------------
+    # CASO 2: NO ES TRASLADO
+    # → eliminar cuentas bancarias
+    # -----------------------------
+    m_no_traslado = (~egreso_solo_banco) & final["_is_bank"]
+
+    final = final.loc[~m_no_traslado].copy()
+
+    # limpieza
+    final.drop(columns=["_is_bank"], inplace=True, errors="ignore")
+
+
+    # ==========================================================
+    # BLOQUEO: cuentas que mandan sobre NIT/Carpeta
+    # ==========================================================
+    final["Cuenta"] = final["Cuenta"].fillna("").astype(str).str.strip()
+
+    is_nomina = final["Cuenta"].str.startswith(("13-65", "23-70", "25-05"), na=False)
+    is_alberto = final["Cuenta"].eq("23-55-05-08") & (final["Vlr Pagado"] > 0)
+
+    is_prioritaria = is_nomina | is_alberto
+
+
+    # Si es Nómina, forzar SIEMPRE:
+    final.loc[is_nomina, "Carpeta"] = "N/A"
+    final.loc[is_nomina, "Concepto"] = "Nomina"
+    final.loc[is_nomina, "Rubro"] = "Salario"
+
+
+    # -------------------------
+    # Reglas base por Carpeta
+    # -------------------------
+    final.loc[final["Carpeta"].str.upper().eq("MERCADEO"), "Rubro"] = "Comercial"
+    final.loc[final["Carpeta"].str.upper().eq("MANTENIMIENTO"), "Rubro"] = "Operaciones y mantenimiento"
+
+    same_rubro = {"MP-Empaque", "Logistica", "GH-SST", "SG-Laboratorio", "Abastecimiento"}
+    final.loc[final["Carpeta"].isin(same_rubro), "Rubro"] = final.loc[final["Carpeta"].isin(same_rubro), "Carpeta"]
+
+    # Carpeta Otros + aprobado por jduque => Administrativo
+    m = final["Carpeta"].str.upper().eq("OTROS") & final["AprobadoPor"].astype(str).str.contains("jduque", na=False)
+    final.loc[m, "Rubro"] = "Administrativo"
+
+    # Carpeta Otros + NIT específico => Operaciones y mantenimiento
+    m = final["Carpeta"].str.upper().eq("OTROS") & final["NIT"].eq("811009788")
+    final.loc[m, "Rubro"] = "Operaciones y mantenimiento"
+
+    # NIT 900311157 => Agropeforestal (regla fuerte)
+    final.loc[final["NIT"].eq("900311157"), "Rubro"] = "Agropeforestal"
+    final.loc[final["NIT"].eq("900311157"), "Concepto"] = "AGROPEFORESTAL"
+
+    # -------------------------
+    # GASTOS FIJOS por NIT
+    # -------------------------
+    admin_nits = {
+        "42885673","43911374","890904078","901298304","8302918","900092385","830122566","800153993","800029972",
+        "71396689","805023598","830114921","98557235","811040572","890903790","899999007","900770336","900201094","901828126"
+    }
+    abast_nits = {"830059699"}
+    comercial_nits = {"41462893","900249397","899999007","900021737","811011779"}
+    ghsst_nits = {"822002322","900238775","890903407","890903790","900779845","900628888"}
+    opm_nits = {"8274481","70352964","900714776","1130679517","830126626","1152196446","91216448",
+                "1234890075","86082731","71480185","91216448","1152205433"}
+
+    is_gf = final["Carpeta"].str.upper().eq("GASTOS FIJOS")
+    final.loc[is_gf & final["NIT"].isin(admin_nits), "Rubro"] = "Administrativo"
+    final.loc[is_gf & final["NIT"].isin(abast_nits), "Rubro"] = "Abastecimiento"
+    final.loc[is_gf & final["NIT"].isin(comercial_nits), "Rubro"] = "Comercial"
+    final.loc[is_gf & final["NIT"].isin(ghsst_nits), "Rubro"] = "GH-SST"
+    final.loc[is_gf & final["NIT"].isin(opm_nits), "Rubro"] = "Operaciones y mantenimiento"
+
+    # -------------------------
+    # Reglas por Cuenta 23-80-20
+    # -------------------------
+    m_238020 = final["Cuenta"].isin(["23-80-20"])
+
+    ghsst_238020 = {"42785977", "1037644672"}
+    op_238020 = {"1036643880", "1037601182", "1234890075", "86082731", "4438727", "71480185"}
+    log_238020 = {"1036643880"}
+
+    final.loc[m_238020 & final["NIT"].isin(ghsst_238020), "Rubro"] = "GH-SST"
+    final.loc[m_238020 & final["NIT"].isin(op_238020), "Rubro"] = "Operaciones y mantenimiento"
+    final.loc[m_238020 & final["NIT"].isin(log_238020), "Rubro"] = "Logistica"
+
+    # cualquier otro NIT en 23-80-20 => Comercial (solo si no quedó ya asignado)
+    m_otro = m_238020 & final["Rubro"].astype(str).str.strip().eq("")
+    final.loc[m_otro, "Rubro"] = "Comercial"
+
+    # ==========================================================
+    # SI 13-30-05 NO CRUZA: copiar Concepto/Rubro del mismo N° de egreso
+    # ==========================================================
+    m_133005_no_cruza = final["Cuenta"].eq("13-30-05") & final["F Fra"].isna()
+    
+    if m_133005_no_cruza.any():
+        key = "N° de egreso"
+
+        tmp = final.copy()
+        tmp["_r"] = tmp["Rubro"].astype(str).str.strip()
+        tmp["_c"] = tmp["Concepto"].astype(str).str.strip()
+
+        rubro_map = (
+            tmp.loc[tmp["_r"].ne(""), [key, "_r"]]
+            .drop_duplicates(subset=[key])
+            .set_index(key)["_r"]
+            .to_dict()
+        )
+
+        concepto_map = (
+            tmp.loc[tmp["_c"].ne(""), [key, "_c"]]
+            .drop_duplicates(subset=[key])
+            .set_index(key)["_c"]
+            .to_dict()
+        )
+
+        final.loc[m_133005_no_cruza, "Rubro"] = (
+            final.loc[m_133005_no_cruza, key].map(rubro_map)
+            .fillna(final.loc[m_133005_no_cruza, "Rubro"])
+        )
+        final.loc[m_133005_no_cruza, "Concepto"] = (
+            final.loc[m_133005_no_cruza, key].map(concepto_map)
+            .fillna(final.loc[m_133005_no_cruza, "Concepto"])
+        )
+
+    # -------------------------
+    # NOTAS
+    # -------------------------
+        # Nota: posible ajuste al peso (52-95-95-01)
+    m_ajuste_peso = final["Cuenta"].astype(str).str.strip().eq("52-95-95-01")
+    final.loc[m_ajuste_peso, "NOTAS"] = (
+        "ERROR CTA: Es posible que necesites la cuenta 53-95-95-01 de ajuste al peso en el egreso N° "
+        + final.loc[m_ajuste_peso, "N° de egreso"].astype(str)
+    )
+    
+    m_notas = final["Rubro"].eq("Agropeforestal") & final["Cuenta"].eq("22-05-01")
+    final.loc[m_notas, "NOTAS"] = "cambiar a cuenta de gastos financieros"
+
+    
+    
+    
+    mask_vto = final["F. VTO"].notna() & final["F Fra"].notna() & (final["F. VTO"] < final["F Fra"])
+    final.loc[mask_vto, "F. VTO"] = final.loc[mask_vto, "F Fra"]
+
+    # ---------- Reglas especiales ----------
+    mask_det = final["F Fra"].isna() & final["Detalle"].astype(str).str.lower().str.contains("vehiculo|auxilio celular", na=False)
+    for col in ["F Fra", "F. VTO", "F. Aprobacion"]:
+        final.loc[mask_det, col] = final.loc[mask_det, "Fecha de pago"]
+    final.loc[mask_det, "Carpeta"] = "Mercadeo"
+    final.loc[mask_det, "Rubro"] = "Comercial"
+    final.loc[mask_det, "Concepto"] = "PROVEEDOR"
+
+    mercadeo_nits = {"40382427", "98561811", "1053808157","1128418791"}
+    #40382427	MONROY QUINTERO OLGA LUCIA    
+    #98561811	NARANJO ARISTIZABAL BERNARDO  
+    #1053808157	TORO ARANGO JOHANA            
+
+    final["NIT"] = final["NIT"].astype(str).str.strip()
+
+    for mask, carpeta, in [
+        ((final["NIT"].isin(mercadeo_nits)) & (~is_prioritaria), "Mercadeo"),
+    ]:
+
+        for col in ["F Fra", "F. VTO", "F. Aprobacion"]:
+            final.loc[mask, col] = final.loc[mask, "Fecha de pago"]
+        final.loc[mask, "Carpeta"] = carpeta
+        final.loc[mask, "Rubro"] = "Comercial"
+        final.loc[mask, "Concepto"] = "PROVEEDOR"
+    
+        sg_nits = {"08356439001","8356439001"}
+    
+    final["NIT"] = final["NIT"].astype(str).str.strip()
+
+    for mask, carpeta, in [
+        (final["NIT"].isin(sg_nits), "SG-laboratorio"),
+    
+    ]:
+        for col in ["F Fra", "F. VTO", "F. Aprobacion"]:
+            final.loc[mask, col] = final.loc[mask, "Fecha de pago"]
+        final.loc[mask, "Carpeta"] = carpeta
+        final.loc[mask, "Rubro"] = "SG-Laboratorio"
+        final.loc[mask, "Concepto"] = "PROVEEDOR"
+        
+    gastos_fijos_nits = {"42885673", "8302918","800157427"}
+    final["NIT"] = final["NIT"].astype(str).str.strip()
+    for mask, carpeta, in [
+        (final["NIT"].isin(gastos_fijos_nits), "GASTOS FIJOS"),
+    ]:
+        for col in ["F Fra", "F. VTO", "F. Aprobacion"]:
+            final.loc[mask, col] = final.loc[mask, "Fecha de pago"]
+        final.loc[mask, "Carpeta"] = carpeta
+        final.loc[mask, "Rubro"] = "Administrativo"
+        final.loc[mask, "Concepto"] = "PROVEEDOR"
+        
+    nit_special = "900021737"
+    mask_900 = final["NIT"].astype(str) == nit_special
+    special_rows = final[mask_900].copy()
+
+    if not special_rows.empty:
+        special_rows["pay_ym"] = special_rows["Fecha de pago"].dt.to_period("M")
+        idx = special_rows.groupby("pay_ym")["Fecha de pago"].idxmax()
+        reps = special_rows.loc[idx].copy()
+
+        agg = special_rows.groupby("pay_ym").agg(
+            VlrPagado_sum=("Vlr Pagado", "sum"),
+            TipoPago=("Tipo de Pago", lambda x: "Abono" if (x == "Abono").any() else "Pago Total"),
+        )
+        reps = reps.merge(agg, left_on="pay_ym", right_index=True, how="left")
+        reps["Vlr Pagado"] = reps["VlrPagado_sum"]
+        reps["Tipo de Pago"] = reps["TipoPago"]
+        reps.drop(columns=["VlrPagado_sum", "TipoPago"], inplace=True)
+
+        rio_900 = rio[rio["nitEmpresa"] == nit_special].dropna(subset=["FechaFactura"]).copy()
+        rio_900["fac_ym"] = rio_900["FechaFactura"].dt.to_period("M")
+        match_map = rio_900.sort_values("FechaFactura").drop_duplicates("fac_ym").set_index("fac_ym")
+
+        reps["F Fra"] = reps["pay_ym"].map(match_map["FechaFactura"]) if not match_map.empty else pd.NaT
+        reps["F. VTO"] = reps["pay_ym"].map(match_map["FechaVencimientoFactura"]) if not match_map.empty else pd.NaT
+        reps["F. Aprobacion"] = reps["pay_ym"].map(match_map["fechaAprobacion"]) if not match_map.empty else pd.NaT
+        reps["Carpeta"] = "GASTOS FIJOS"
+
+        final = pd.concat([final[~mask_900], reps.drop(columns=["pay_ym"])], ignore_index=True)
+
+    # ---------- Deltas ----------
+    final["Dias Aprobacion"] = (final["F. Aprobacion"] - final["F Fra"]).dt.days
+    final["Dias de pago"] = (final["Fecha de pago"] - final["F. VTO"]).dt.days
+    final.loc[final["NIT"].astype(str) == "890903790", "Dias de pago"] = 0
+    
+    # ==========================================================
+    # HEREDAR Concepto/Rubro por N° de egreso para cuentas target
+    # (poner lo mismo que tenga el egreso en otras filas)
+    # ==========================================================
+    targets = {"42-95-81", "53-05-25", "53-95-95-01", "42-10-20"}
+
+    final["Cuenta"] = final["Cuenta"].fillna("").astype(str).str.strip()
+    final["Concepto"] = final["Concepto"].fillna("").astype(str).str.strip()
+    final["Rubro"] = final["Rubro"].fillna("").astype(str).str.strip()
+
+    m_targets = final["Cuenta"].isin(targets)
+
+    # Donantes: filas del mismo egreso que NO sean target y que tengan algo útil (prioridad: Rubro lleno)
+    don = final.loc[~m_targets, ["N° de egreso", "Concepto", "Rubro"]].copy()
+    don["Concepto"] = don["Concepto"].fillna("").astype(str).str.strip()
+    don["Rubro"] = don["Rubro"].fillna("").astype(str).str.strip()
+
+    # Solo filas con información útil:
+    don = don[(don["Rubro"] != "") | (don["Concepto"] != "")].copy()
+
+    # Score para escoger mejor donante por egreso (Rubro lleno vale más)
+    don["_score"] = (don["Rubro"].ne("")).astype(int) * 2 + (don["Concepto"].ne("")).astype(int)
+    don = don.sort_values(["N° de egreso", "_score"], ascending=[True, False])
+
+    # Tomar el mejor donante por egreso
+    don_map = don.drop_duplicates(subset=["N° de egreso"], keep="first").set_index("N° de egreso")[["Concepto", "Rubro"]]
+
+    # Aplicar herencia SOLO a targets y SOLO si existe donante
+    idx_target = final.index[m_targets]
+    final.loc[idx_target, "Concepto"] = final.loc[idx_target, "N° de egreso"].map(don_map["Concepto"]).fillna(final.loc[idx_target, "Concepto"])
+    final.loc[idx_target, "Rubro"]    = final.loc[idx_target, "N° de egreso"].map(don_map["Rubro"]).fillna(final.loc[idx_target, "Rubro"])
+
+    final.drop(columns=["_score"], inplace=True, errors="ignore")
+
+
+    out = final[
+        [
+            "Criterio", "N° de egreso", "X", "Banco", "Cuenta", "Fecha de pago", "Documento",
+            "Docto. Referencia", "Detalle", "NIT", "Nombre NIT", "Tipo de Pago", "Vlr Pagado",
+            "F Fra", "F. VTO", "F. Aprobacion", "Dias Aprobacion", "Dias de pago", "Carpeta","Concepto", "Rubro", "NOTAS",
+        ]
+        ].copy()
+
+    no_cruzan = out[out["F Fra"].isna()].copy()
+    if not no_cruzan.empty:
+        no_cruzan.insert(0, "Motivo", "No cruza con Aplicativo (sin FechaFactura)")
+    else:
+        no_cruzan = out.head(0).copy()
+        no_cruzan.insert(0, "Motivo", pd.Series(dtype="object"))
+
+    return out, no_cruzan
 
 # ==========================================================
 # Pipeline completo
@@ -877,8 +1816,18 @@ def run_pipeline(cfg: RunConfig, log) -> Dict[str, pd.DataFrame]:
 
     cruce_df, pend_b, pend_a = cruzar(bancos, auxiliar, cfg, log)
     bancos_final = add_documento_column(bancos, auxiliar, cruce_df)
-
-    return {
+        # ---------------------------
+    # Comprobante (Reporte movimiento por comprobante)
+    # ---------------------------
+    comp_df = None
+    comp_no_cruzan = None
+    if cfg.contables.reporte_comprobantes_xlsx and cfg.otros.aplicativo_xlsx:
+        log("Generando hoja Comprobante…")
+        comp_df, comp_no_cruzan = build_comprobante_and_no_cruzan(
+            cfg.contables.reporte_comprobantes_xlsx,
+            cfg.otros.aplicativo_xlsx
+        )
+    out ={
         "Bancos": bancos_final,
         "Auxiliar": auxiliar,
         "Cruce Bancos-Aux": cruce_df,
@@ -886,6 +1835,12 @@ def run_pipeline(cfg: RunConfig, log) -> Dict[str, pd.DataFrame]:
         "Pendientes Auxiliar": pend_a,
     }
 
+    if comp_df is not None:
+        out["Comprobante"] = comp_df
+    if comp_no_cruzan is not None:
+        out["Comprobante - No cruzan"] = comp_no_cruzan
+
+    return out
 
 def save_excel(out_path: str, sheets: Dict[str, pd.DataFrame]):
     out = Path(out_path)
@@ -1181,4 +2136,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
