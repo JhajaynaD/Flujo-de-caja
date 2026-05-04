@@ -104,7 +104,7 @@ class BankFiles:
 
     davivienda_xls: Optional[str] = None
 
-    agrario_mov_xls: Optional[str] = None
+    load_agrario_mov_CSV: Optional[str] = None
     agrario_inf_xls: Optional[str] = None
 
     bbva_xls: Optional[str] = None
@@ -131,6 +131,7 @@ class RunConfig:
     tol_nomina_days: int = 5
     tol_general_days: int = 3
     tol_bbva_sum_days: int = 5
+    tol_davivienda_sum_days: int = 5
 
     bancos: BankFiles = field(default_factory=BankFiles)
     contables: AccountingFiles = field(default_factory=AccountingFiles)
@@ -219,6 +220,7 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         ("BANCOLOMBIA", "TRANSF INTERNACIONAL RECIBIDA", "Ingreso", "", "Bancolombia"),
         ("BANCOLOMBIA", "TRANSFERENCIA DESDE NEQUI", "Ingreso", "", "Bancolombia"),
         ("BANCOLOMBIA", "TRASLADO DE FONDO DE INVERS", "Ingreso", "", "Traslado"),
+        ("BANCOLOMBIA", "ABONO DESEMBOLSO DE CREDITO", "Ingreso", "", "Bancolombia"),
 
         # FIDUCIA
         ("FIDUCIA", "TRASLADO DESDE", "Ingreso", "", "Traslado"),
@@ -237,6 +239,7 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         ("BOGOTÁ", "CR ACH BANCOLOMBIA RIO CLARO TECNOL NIT890927624 FAC RIO CLARO TECNOLOGIA", "Ingreso", "", "Traslado"),
         ("BOGOTÁ", "PAGO AUTOMATICO CUOTA DE CREDITO", "Egreso", "", "Credito"),
         ("BOGOTÁ", "PAGO TARJETA", "Egreso", "", "Credito"),
+        ("BOGOTÁ", "PAGO AUTOMATICO CUOTA DE CREDI", "Egreso", "", "Credito"),
         ("BOGOTÁ", "ABONO DISPERSION PAGO A PROVEEDORES", "Ingreso", "", "Bogotá"),
         ("BOGOTÁ", "ABONO POR DEPOSITO EN CORRESPONSAL", "Ingreso", "", "Bogotá"),
         ("BOGOTÁ", "ABONO TRANSFERENCIA POR BUSINESS", "Ingreso", "", "Bogotá"),
@@ -250,6 +253,7 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         ("DAVIVIENDA", "PAGO CREDITO N", "Egreso", "", "Credito"),
         ("DAVIVIENDA", "ABONO", "Ingreso", "", "Davivienda"),
         ("DAVIVIENDA", "CONSIGNACION EFECTIVO EN OFICINA", "Ingreso", "", "Davivienda"),
+        ("DAVIVIENDA", "Descuento Transfer.C **0000", "Egreso", "", "Proveedores"),
     ]
 
     # --- REGLA ESPECIAL: BANCOLOMBIA "TRANSFERENCIA CTA SUC VIRTUAL" depende del signo ---
@@ -334,8 +338,10 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
     b.loc[m, "Cuenta"] = "530515"
     b.loc[m, "Concepto"] = "GASTOS BANCARIOS"
     
+    
     m = empty_tipo & (
-        b["_detalle_norm"].str.contains("CUOTA MANEJO", na=False)
+        b["_detalle_norm"].str.contains("CUOTA MANEJO", na=False) |
+        b["_detalle_norm"].str.contains("CUOTA PLAN CANAL NEGOCIOS", na=False)
     )
     b.loc[m, "Tipo"] = "GB"
     b.loc[m, "Cuenta"] = "530505"
@@ -354,6 +360,7 @@ def apply_embedded_rules_to_bancos(bancos: pd.DataFrame) -> pd.DataFrame:
         b["_detalle_norm"].str.contains("IMPTO GOBIERNO 4X1000", na=False) |
         b["_detalle_norm"].str.contains("CARGO POR IMPUE", na=False) |
         b["_detalle_norm"].str.contains("CORRECCION IMPT", na=False) |
+        b["_detalle_norm"].str.contains("GRAVAMEN MOVIMIENTOS FINANCIER", na=False) |
         b["_detalle_norm"].str.contains("GRAVAMEN MOVIMIENTOS FINANCIEROS", na=False)
     )
     b.loc[m, "Tipo"] = "GB"
@@ -556,7 +563,7 @@ def load_bogota_informe_csv(path: str, year: int) -> pd.DataFrame:
     deb = df.iloc[:, 4].apply(to_float_money)
     cred = df.iloc[:, 5].apply(to_float_money)
     valor = (cred - deb).astype(float)
-
+    
     out = pd.DataFrame({"Banco": "Bogotá", "Fecha": fecha, "Detalle": detalle, "Valor": valor})
     return out.dropna(subset=["Fecha"])
 
@@ -602,7 +609,7 @@ def _agrario_split_iva(df_in: pd.DataFrame, base_text: str) -> pd.DataFrame:
     return pd.concat([rest, pd.DataFrame(new_rows)], ignore_index=True)
 
 
-def load_agrario_mov_xls(path: str, anio: int, mes: int) -> pd.DataFrame:
+"""def load_agrario_mov_xls(path: str, anio: int, mes: int) -> pd.DataFrame:
     df = pd.read_excel(path, skiprows=10, dtype=object)
     fecha = pd.to_datetime(df.iloc[:, 0], errors="coerce", dayfirst=False).dt.normalize()
     detalle = df.iloc[:, 2].astype(str).str.strip()
@@ -610,6 +617,36 @@ def load_agrario_mov_xls(path: str, anio: int, mes: int) -> pd.DataFrame:
     credito = pd.to_numeric(df.iloc[:, 3], errors="coerce").fillna(0.0)
     debito = pd.to_numeric(df.iloc[:, 4], errors="coerce").fillna(0.0)
     valor = (debito - credito).astype(float)
+
+    out = pd.DataFrame({"Banco": "Agrario", "Fecha": fecha, "Detalle": detalle, "Valor": valor}).dropna(subset=["Fecha"])
+
+    gmf_col = df.iloc[:, 5] if df.shape[1] > 5 else pd.Series([0] * len(df))
+    gmf_total = pd.to_numeric(gmf_col, errors="coerce").fillna(0.0).sum()
+    if gmf_total != 0:
+        out = pd.concat([out, pd.DataFrame([{
+            "Banco": "Agrario",
+            "Fecha": last_day_of_month(anio, mes),
+            "Detalle": "GMF",
+            "Valor": -abs(float(gmf_total))
+        }])], ignore_index=True)
+
+    out = _agrario_split_iva(out, "CNV COBRO COMISION PAGO CONVENIOS")
+    out = _agrario_split_iva(out, "DB CTA CTE COMISION INTERBANCARIA")
+
+    return out"""
+    
+#CARGAR MOVIMIENTO AGRARIO EN csv, encabezado fila 7, Fecha columna a, detalle columna c, credito columna e, debito columna d, gmf columna f columna valor seria credito - debito, 
+# si gmf columna f tiene valor se agrega fila adicional con detalle GMF y valor negativo del gmf, se hace split de iva para los detalles que contengan "CNV COBRO COMISION PAGO CONVENIOS" o "DB CTA CTE COMISION INTERBANCARIA" 
+# asumiendo que el valor incluye IVA 19% y se separa en base e IVA
+
+def load_agrario_mov_CSV(path: str, anio: int, mes: int) -> pd.DataFrame:
+    df = pd.read_csv(path, skiprows=6, dtype=str, encoding="latin1")
+    fecha = pd.to_datetime(df.iloc[:, 0], errors="coerce", dayfirst=False).dt.normalize()
+    detalle = df.iloc[:, 2].astype(str).str.strip()
+
+    credito = df.iloc[:, 4].apply(to_float_money)
+    debito = df.iloc[:, 3].apply(to_float_money)
+    valor = (credito - debito).astype(float)
 
     out = pd.DataFrame({"Banco": "Agrario", "Fecha": fecha, "Detalle": detalle, "Valor": valor}).dropna(subset=["Fecha"])
 
@@ -687,9 +724,9 @@ def build_bancos(cfg: RunConfig, log) -> pd.DataFrame:
         log("Cargando Davivienda…")
         parts.append(load_davivienda_xls(cfg.bancos.davivienda_xls))
 
-    if cfg.bancos.agrario_mov_xls:
+    if cfg.bancos.agrario_mov_csv:
         log("Cargando Agrario Movimientos…")
-        parts.append(load_agrario_mov_xls(cfg.bancos.agrario_mov_xls, cfg.anio, cfg.mes))
+        parts.append(load_agrario_mov_CSV(cfg.bancos.agrario_mov_csv, cfg.anio, cfg.mes))
     elif cfg.bancos.agrario_inf_xls:
         log("Cargando Agrario Informe…")
         parts.append(load_agrario_informe_xls(cfg.bancos.agrario_inf_xls, cfg.anio, cfg.mes))
@@ -946,6 +983,77 @@ def cruzar(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cfg: RunConfig, log) ->
                 matched_b.add(int(ib))
 
             matched_a.add(ia)
+            
+    
+    # 4) DAVIVIENDA: 1 banco vs suma diaria auxiliar (dinámico)
+    tol_davivienda = timedelta(days=cfg.tol_davivienda_sum_days)
+
+    def _norm(s):
+        return (
+            s.fillna("")
+            .astype(str)
+            .str.replace("\xa0", " ", regex=False)
+            .str.replace(r"\s+", " ", regex=True)
+            .str.strip()
+            .str.upper()
+        )
+
+    b_banco = _norm(b["Banco"])
+    b_tipo  = _norm(b["Tipo"])
+    b_det   = _norm(b["Detalle"])
+
+    # Detecta cualquier Descuento Transfer sin depender del texto completo
+    davivienda_cargo = b[
+        (b_banco == "DAVIVIENDA") &
+        (b_tipo == "EGRESO") &
+        (b_det.str.contains("DESCUENTO TRANSFER", regex=False)) &
+        (~b["idx_banco"].isin(matched_b))
+    ].copy()
+
+    if not davivienda_cargo.empty:
+
+        aux_davivienda = a[
+            (_norm(a["Banco"]) == "DAVIVIENDA") &
+            (_norm(a["Tipo"]) == "EGRESO") &
+            (~a["idx_aux"].isin(matched_a))
+        ].copy()
+
+        sum_by_day = aux_davivienda.groupby("Fecha")["Valor"].sum().round(2)
+        day_to_idxs = aux_davivienda.groupby("Fecha")["idx_aux"].apply(list).to_dict()
+
+        for _, rb in davivienda_cargo.iterrows():
+            fb = rb["Fecha"]
+            vb = round(float(rb["Valor"]), 2)
+
+            window = sum_by_day.loc[
+                (sum_by_day.index >= fb - tol_davivienda) &
+                (sum_by_day.index <= fb + tol_davivienda)
+            ]
+
+            if window.empty:
+                continue
+
+            # tolerancia de 1 peso por seguridad
+            hit = window[(window - vb).abs() <= 1]
+
+            if hit.empty:
+                continue
+
+            fa = hit.index[0]
+            idxs_aux = day_to_idxs.get(fa, [])
+            if not idxs_aux:
+                continue
+
+            # 1 banco -> múltiples auxiliares
+            for ia in idxs_aux:
+                links.append((int(rb["idx_banco"]), int(ia), "DAVIVIENDA_SUMDIA"))
+                matched_a.add(int(ia))
+
+            matched_b.add(int(rb["idx_banco"]))
+
+
+
+            
     # ========================= PASO X =========================
         # X) Auxiliar INGRESO no cruzado: si el detalle trae fecha dd/mm/yyyy, cruzar contra Bancos por esa fecha exacta
     log("Cruce extra: Auxiliar Ingresos con fecha embebida en Detalle (dd/mm/yyyy)…")
@@ -1088,6 +1196,163 @@ def add_documento_column(bancos: pd.DataFrame, auxiliar: pd.DataFrame, cruce_df:
         except:
             pass
     return b
+
+
+def build_flujo_ejecutado(bancos_df: pd.DataFrame, comprobante_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Hoja: Flujo Ejecutado
+    - Tipo como primera columna (desde Bancos).
+    - Match: Comprobante["N° de egreso"] == Bancos["documento"] (explode si hay varios docs separados por coma)
+    - Si NO hay match en Comprobante:
+        - Concepto = Bancos["Concepto"]
+        - Rubro = Concepto
+    - Incluir también filas de Bancos SIN documento (documento vacío),
+      incluyendo Ingresos, Egresos y GB.
+    """
+
+    bancos = bancos_df.copy()
+    comp = comprobante_df.copy()
+
+    banco_to_code = {
+        "BANCOLOMBIA": "B07",
+        "AGRARIO": "B40",
+        "BBVA": "B13",
+        "BOGOTÁ": "B01",
+        "BOGOTA": "B01",
+        "DAVIVIENDA": "B51",
+    }
+
+    # -------------------------
+    # Normalizar y EXPLODE de Bancos.documento
+    # -------------------------
+    if "documento" not in bancos.columns:
+        bancos["documento"] = ""
+    if "Tipo" not in bancos.columns:
+        bancos["Tipo"] = ""   # por seguridad
+
+    bancos["documento"] = bancos["documento"].fillna("").astype(str).str.strip()
+
+    bancos["_doc_list"] = bancos["documento"].apply(
+        lambda x: [t.strip() for t in x.split(",") if t.strip()] if x else []
+    )
+    bancos_exp = bancos.explode("_doc_list").copy()
+
+    bancos_exp["DocKey"] = bancos_exp["_doc_list"].fillna("").astype(str).str.strip()
+    bancos_exp["BancoCode"] = (
+        bancos_exp["Banco"].fillna("").astype(str).str.upper().str.strip().map(banco_to_code).fillna("")
+    )
+
+    # -------------------------
+    # BASE 1: Comprobante
+    # -------------------------
+    comp["DocKey"] = comp["N° de egreso"].fillna("").astype(str).str.strip()
+    
+    flujo_comp = pd.DataFrame({
+        # Tipo lo llenamos luego con merge desde Bancos
+        "N° De Documento": comp["DocKey"],
+        "Banco": comp["Banco"].fillna("").astype(str).str.strip(),
+        "Cuenta": comp["Cuenta"].fillna("").astype(str).str.strip(),
+        "Fecha": pd.to_datetime(comp["Fecha de pago"], errors="coerce"),
+        "Docto. Referencia": comp["Docto. Referencia"].fillna("").astype(str).str.strip(),
+        "Detalle": comp["Detalle"].fillna("").astype(str).str.strip(),
+        "NIT": comp["NIT"].fillna("").astype(str).str.strip(),
+        "Nombre NIT": comp["Nombre NIT"].fillna("").astype(str).str.strip(),
+        "Vlr Pagado": pd.to_numeric(comp["Vlr Pagado"], errors="coerce").fillna(0.0),
+        "Concepto": comp["Concepto"].fillna("").astype(str).str.strip(),
+        "Rubro": comp["Rubro"].fillna("").astype(str).str.strip(),
+    })
+
+    # ---- Traer Tipo desde Bancos para los que hagan match ----
+    # (Si hay varios registros de bancos para un mismo DocKey, tomamos el primero no vacío)
+    tipo_map = (
+        bancos_exp.loc[bancos_exp["DocKey"].ne(""), ["DocKey", "Tipo"]]
+        .copy()
+    )
+    tipo_map["Tipo"] = tipo_map["Tipo"].fillna("").astype(str).str.strip()
+    tipo_map = tipo_map.sort_values(["DocKey"]).drop_duplicates(subset=["DocKey"], keep="first")
+
+    # unir Tipo desde bancos: DocKey (bancos) vs N° De Documento (comprobante)
+    flujo_comp = flujo_comp.merge(
+        tipo_map,
+        left_on="N° De Documento",
+        right_on="DocKey",
+        how="left"
+    )
+
+    flujo_comp["Tipo"] = flujo_comp["Tipo"].fillna("").astype(str).str.strip()
+
+    # limpiar columna auxiliar de la derecha
+    flujo_comp.drop(columns=["DocKey"], inplace=True, errors="ignore")
+
+
+    # -------------------------
+    # BASE 2: Bancos SOLO si no hay match en Comprobante
+    #   a) Bancos con documento NO match
+    #   b) Bancos SIN documento (vacío) -> incluir también
+    # -------------------------
+    comp_keys = set(flujo_comp["N° De Documento"].dropna().astype(str).str.strip().unique())
+
+    # a) Bancos con DocKey y NO están en Comprobante
+    bancos_only_docs = bancos_exp[
+        (bancos_exp["DocKey"].ne("")) &
+        (~bancos_exp["DocKey"].astype(str).isin(comp_keys))
+    ].copy()
+
+    # b) Bancos sin documento (documento vacío) -> incluir tal cual
+    bancos_sin_doc = bancos[
+        bancos["documento"].fillna("").astype(str).str.strip().eq("")
+    ].copy()
+    bancos_sin_doc["DocKey"] = ""  # para la columna N° De Documento
+    bancos_sin_doc["BancoCode"] = (
+        bancos_sin_doc["Banco"].fillna("").astype(str).str.upper().str.strip().map(banco_to_code).fillna("")
+    )
+
+    # Unificar bancos-only
+    bancos_only = pd.concat([bancos_only_docs, bancos_sin_doc], ignore_index=True)
+
+    bancos_only["Vlr Pagado"] = pd.to_numeric(bancos_only.get("Valor", 0), errors="coerce").fillna(0.0)
+    bancos_only["Concepto"] = bancos_only.get("Concepto", "").fillna("").astype(str).str.strip()
+    bancos_only["Rubro"] = bancos_only["Concepto"]
+    bancos_only["Tipo"] = bancos_only.get("Tipo", "").fillna("").astype(str).str.strip()
+
+    flujo_bancos = pd.DataFrame({
+        "Tipo": bancos_only["Tipo"],
+        "N° De Documento": bancos_only["DocKey"],
+        "Banco": bancos_only["BancoCode"],
+        "Cuenta": bancos_only.get("Cuenta", "").fillna("").astype(str).str.strip(),
+        "Fecha": pd.to_datetime(bancos_only.get("Fecha", pd.NaT), errors="coerce"),
+        "Docto. Referencia": "",
+        "Detalle": bancos_only.get("Detalle", "").fillna("").astype(str).str.strip(),
+        "NIT": "",
+        "Nombre NIT": "",
+        "Vlr Pagado": bancos_only["Vlr Pagado"],
+        "Concepto": bancos_only["Concepto"],
+        "Rubro": bancos_only["Rubro"],
+    })
+
+    # A flujo_comp le falta la columna Tipo al inicio (ya la tiene después del merge)
+    # la reordenamos luego en cols final
+
+    # -------------------------
+    # Unir y ordenar
+    # -------------------------
+    flujo = pd.concat([flujo_comp, flujo_bancos], ignore_index=True)
+
+    # Si algún registro de Comprobante quedó sin Tipo (porque no existe en Bancos), queda vacío.
+    flujo["Tipo"] = flujo.get("Tipo", "").fillna("").astype(str).str.strip()
+
+    cols = [
+        "Tipo",
+        "N° De Documento", "Banco", "Cuenta", "Fecha", "Docto. Referencia",
+        "Detalle", "NIT", "Nombre NIT", "Vlr Pagado", "Concepto", "Rubro"
+    ]
+    flujo = flujo[cols].copy()
+
+    flujo["Fecha"] = pd.to_datetime(flujo["Fecha"], errors="coerce")
+    flujo = flujo.sort_values(["Tipo", "N° De Documento", "Fecha"], kind="mergesort").reset_index(drop=True)
+
+    return flujo
+
 
     # ==========================================================
 # COMPROBANTES (Reporte movimiento por comprobante) -> Hoja "Comprobante"
@@ -1816,7 +2081,8 @@ def run_pipeline(cfg: RunConfig, log) -> Dict[str, pd.DataFrame]:
 
     cruce_df, pend_b, pend_a = cruzar(bancos, auxiliar, cfg, log)
     bancos_final = add_documento_column(bancos, auxiliar, cruce_df)
-        # ---------------------------
+
+    # ---------------------------
     # Comprobante (Reporte movimiento por comprobante)
     # ---------------------------
     comp_df = None
@@ -1827,7 +2093,11 @@ def run_pipeline(cfg: RunConfig, log) -> Dict[str, pd.DataFrame]:
             cfg.contables.reporte_comprobantes_xlsx,
             cfg.otros.aplicativo_xlsx
         )
-    out ={
+
+    # ---------------------------
+    # Diccionario de salida BASE
+    # ---------------------------
+    out = {
         "Bancos": bancos_final,
         "Auxiliar": auxiliar,
         "Cruce Bancos-Aux": cruce_df,
@@ -1835,12 +2105,23 @@ def run_pipeline(cfg: RunConfig, log) -> Dict[str, pd.DataFrame]:
         "Pendientes Auxiliar": pend_a,
     }
 
+    # Agregar hojas Comprobante si existen
     if comp_df is not None:
         out["Comprobante"] = comp_df
     if comp_no_cruzan is not None:
         out["Comprobante - No cruzan"] = comp_no_cruzan
 
+    # ---------------------------
+    # Flujo Ejecutado = Bancos + Comprobante
+    # (solo si existe comp_df)
+    # ---------------------------
+    if comp_df is not None:
+        log("Generando hoja Flujo Ejecutado…")
+        flujo_df = build_flujo_ejecutado(bancos_final, comp_df)
+        out["Flujo Ejecutado"] = flujo_df
+
     return out
+
 
 def save_excel(out_path: str, sheets: Dict[str, pd.DataFrame]):
     out = Path(out_path)
@@ -1907,6 +2188,7 @@ class MainWindow(QMainWindow):
         self.sp_tol_nom = QSpinBox(); self.sp_tol_nom.setRange(0, 30); self.sp_tol_nom.setValue(5)
         self.sp_tol_gen = QSpinBox(); self.sp_tol_gen.setRange(0, 30); self.sp_tol_gen.setValue(3)
         self.sp_tol_bbva = QSpinBox(); self.sp_tol_bbva.setRange(0, 30); self.sp_tol_bbva.setValue(5)
+        self.sp_tol_davivienda = QSpinBox(); self.sp_tol_davivienda.setRange(0, 30); self.sp_tol_davivienda.setValue(5)
 
         lp.addWidget(QLabel("Mes:")); lp.addWidget(self.cmb_mes)
         lp.addSpacing(10)
@@ -1915,6 +2197,7 @@ class MainWindow(QMainWindow):
         lp.addWidget(QLabel("Tol Nómina (días):")); lp.addWidget(self.sp_tol_nom)
         lp.addWidget(QLabel("Tol General (días):")); lp.addWidget(self.sp_tol_gen)
         lp.addWidget(QLabel("Tol BBVA Suma (días):")); lp.addWidget(self.sp_tol_bbva)
+        lp.addWidget(QLabel("Tol Davivienda Suma (días):")); lp.addWidget(self.sp_tol_davivienda)
         lp.addStretch(1)
 
         # Bancos
@@ -1946,7 +2229,7 @@ class MainWindow(QMainWindow):
         self.bg_agr.addButton(self.rb_agr_mov); self.bg_agr.addButton(self.rb_agr_inf)
         self.rb_agr_mov.setChecked(True)
 
-        self.fp_agr_mov = FilePicker("Agrario - Movimientos (XLS)", "Excel (*.xls *.xlsx);;Todos (*.*)")
+        self.fp_agr_mov = FilePicker("Agrario - Movimientos (CSV)", "CSV (*.csv);;Todos (*.*)")
         self.fp_agr_inf = FilePicker("Agrario - Informe (XLS)", "Excel (*.xls *.xlsx);;Todos (*.*)")
 
         # Layout bancos
@@ -2059,7 +2342,7 @@ class MainWindow(QMainWindow):
             banc.bogota_inf_year = int(self.sp_bog_inf_year.value())
 
         if self.rb_agr_mov.isChecked():
-            banc.agrario_mov_xls = self.fp_agr_mov.get()
+            banc.agrario_mov_csv = self.fp_agr_mov.get()
         else:
             banc.agrario_inf_xls = self.fp_agr_inf.get()
 
@@ -2080,6 +2363,7 @@ class MainWindow(QMainWindow):
             tol_nomina_days=int(self.sp_tol_nom.value()),
             tol_general_days=int(self.sp_tol_gen.value()),
             tol_bbva_sum_days=int(self.sp_tol_bbva.value()),
+            tol_davivienda_sum_days=int(self.sp_tol_davivienda.value()),
             bancos=banc,
             contables=cont,
             otros=otros,
@@ -2096,7 +2380,7 @@ class MainWindow(QMainWindow):
         if self.rb_bog_inf.isChecked() and (not cfg.bancos.bogota_inf_csv or not cfg.bancos.bogota_inf_year):
             raise ValueError("Bogotá Informe requiere archivo y año.")
 
-        if self.rb_agr_mov.isChecked() and not cfg.bancos.agrario_mov_xls:
+        if self.rb_agr_mov.isChecked() and not cfg.bancos.agrario_mov_csv:
             raise ValueError("Agrario Movimiento seleccionado pero sin archivo.")
         if self.rb_agr_inf.isChecked() and not cfg.bancos.agrario_inf_xls:
             raise ValueError("Agrario Informe seleccionado pero sin archivo.")
